@@ -1,0 +1,77 @@
+#!/bin/bash
+
+rml() {
+    LFN=$1
+    if [ ! -L $LFN ]; then
+        echo "$LFN is not a valid LFN"
+        exit 1
+    fi
+    
+    PFN=$(ls -l --color=never $LFN | awk '{print $11}')
+
+    rm -f $PFN $LFN
+}
+
+rmr() {
+    dir=$1
+    for file in $(ls $dir); do
+        if [ -d $dir/$file ]; then
+            rmr $dir/$file
+        elif [ -L $dir/$file ]; then
+            rml $dir/$file
+        fi
+    done
+}
+
+ndisk=7
+
+recursive=0
+if [ "$1" = "-r" ]; then
+    recursive=1
+    shift
+fi
+
+targs=$@
+
+for targ in $targs; do
+
+    if [ "${targ:0:7}" != "/store/" ]; then
+        echo "LFN must start from /store/"
+        exit 1
+    fi
+    
+    if [ $recursive -ne 0 ]; then
+        if [ ! -d $targ ]; then
+            echo "$targ is not a directory"
+            exit 1
+        fi
+    
+        echo "Recursive flag is on. Are you sure you want to remove ${targ} [Y/n]?"
+        while read answer; do
+            case $answer in
+                Y)
+                    break
+                    ;;
+                n)
+                    exit 0
+                    ;;
+                *)
+                    continue
+                    ;;
+            esac
+        done
+    
+        rmr $targ
+        rm -rf $targ
+        targ=${targ:7:${#targ}}
+        idisk=0
+        while [ $idisk -lt $ndisk ]; do
+            rm -rf /data/disk$idisk/$targ
+            idisk=$(($idisk+1))
+        done
+    else
+        rml $targ
+    fi
+
+done
+

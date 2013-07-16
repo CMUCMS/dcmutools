@@ -1,0 +1,48 @@
+#!/bin/bash
+
+SOURCE=$1
+LFN=$2
+
+if [ ! -f $SOURCE ]; then
+    echo "$SOURCE not a regular file"
+    exit 1
+fi
+
+if [ -L $LFN ]; then
+    echo "$LFN already exists as an LFN"
+    exit 1
+fi
+
+if [ "${LFN:0:7}" != "/store/" ]; then
+    echo "LFN must start from /store/"
+    exit 1
+fi
+
+LFDIR=$(dirname $LFN)
+
+if [ -e $LFDIR -a ! -d $LFDIR ]; then
+    echo "Cannot make $LFDIR into a directory"
+    exit 1
+fi
+
+if [ ! -e $LFDIR ]; then
+    mkdir -p $LFDIR
+fi
+
+# use the least occupied disk
+DISK=$(df | awk 'BEGIN {min=-1; disk=""}; /disk[0-9]*/ {if(min < 0 || min > $3){min = $3; disk=$6; sub(/\/data\//, "", disk);}}; END {print disk}')
+
+PFN=/data/${DISK}/${LFN:7}
+
+PFDIR=$(dirname $PFN)
+
+if [ -e $PFDIR -a ! -d $PFDIR ]; then
+    echo "Destination is not a directory"
+    exit 1
+fi
+
+if [ ! -e $PFDIR ]; then
+    mkdir -p $PFDIR
+fi
+
+cp $SOURCE $PFN && ln -s $PFN $LFN

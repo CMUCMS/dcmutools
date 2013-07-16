@@ -1,0 +1,57 @@
+#!/bin/bash
+
+NDISK=7
+
+READABLE=0
+PERFILE=0
+while [[ $1 ]]; do
+    case $1 in
+	-h)
+	    READABLE=1
+	    shift
+	    ;;
+        -l)
+            PERFILE=1
+            shift
+            ;;
+	*)
+	    DS=$1
+	    break
+	    ;;
+    esac
+done
+
+if [[ ! $DS =~ "^/store/.*" ]]; then
+    echo "$DS is not an LF path to a dataset"
+    exit 1
+fi
+
+if [ $PERFILE -eq 1 ]; then
+    readable=""
+    [ $READABLE -eq 1 ] && readable="-h"
+    for file in $(ls $DS); do
+        du -bs $readable $(readlink $DS/$file)
+    done
+else
+    size=0
+    IDISK=0
+    while [ $IDISK -lt $NDISK ]; do
+        DATADIR=${DS/store/data\/disk$IDISK/}
+        if [ -d $DATADIR ]; then
+            size=$(($size+$(du -bs $DATADIR | awk '{print $1}')))
+        fi
+        IDISK=$(($IDISK+1))
+    done
+
+    if [ $READABLE -eq 1 -a $size -ge 1024 ]; then
+        for unit in k M G T P; do
+            size=$(echo "scale=2; $size / 1024." | bc -q)
+            if [ $(echo "$size < 1024." | bc -q) -eq 1 ]; then
+                size=$size$unit
+                break
+            fi
+        done
+    fi
+
+    echo "$size $DS"
+fi

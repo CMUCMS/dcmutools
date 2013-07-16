@@ -1,0 +1,36 @@
+#!/bin/bash
+
+SOURCE=$1
+DEST=$2
+
+if [ ! -L $SOURCE ]; then
+    echo "$SOURCE not an LFN"
+    exit 1
+fi
+
+if [ -L $DEST ]; then
+    echo "$DEST already exists as an LFN"
+    exit 1
+fi
+
+if [ "${SOURCE:0:7}" != "/store/" -o "${DEST:0:7}" != "/store/" ]; then
+    echo "LFN must start from /store/"
+    exit 1
+fi
+
+DESTDIR=$(dirname $DEST)
+
+if [ -e $DESTDIR -a ! -d $DESTDIR ]; then
+    echo "Cannot make $DESTDIR into a directory"
+    exit 1
+fi
+
+if [ ! -e $DESTDIR ]; then
+    mkdir -p $DESTDIR
+fi
+
+PFN=$(readlink $SOURCE)
+
+rm $SOURCE
+
+ln -s $PFN $DEST
