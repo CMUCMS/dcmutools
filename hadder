@@ -1,0 +1,29 @@
+#!/bin/bash
+
+CMSSW_BASE=$1
+OUTPUTDIR=$2/output
+LOGFILE=$3
+[ -z "$LOGFILE" ] && LOGFILE=$OUTPUTDIR/hadd.log
+
+exec 1>$LOGFILE 2>&1
+
+CWD=$PWD
+cd $CMSSW_BASE
+eval `/afs/cern.ch/cms/common/scramv1 runtime -sh`
+cd $CWD
+
+OUTPUT=$OUTPUTDIR/merged.root
+TMPOUT=$OUTPUTDIR/tmp.root
+
+while read ROOTFILE; do
+    [ -z "$ROOTFILE" ] && break
+
+    if [ -e $OUTPUT ]; then
+        hadd $TMPOUT $ROOTFILE $OUTPUT && mv $TMPOUT $OUTPUT && rm $ROOTFILE
+    else
+        mkdir -p $OUTPUTDIR
+        cp $ROOTFILE $OUTPUT
+    fi
+done
+
+echo $OUTPUT

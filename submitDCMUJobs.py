@@ -26,7 +26,6 @@ Jobs will be scheduled based on the list of files on each disk unless an externa
 void myMacro(..., TString const& dataset, TObjArray* tasks, TObjArray* outputNames)''')
 
 runtimeOpts = OptionGroup(parser, "Runtime Options", "These options can be changed for each job submission.")
-runtimeOpts.add_option("-q", "--queue", dest="queue", help='lxbatch queue to submit', metavar="QUEUE", default='1nh')
 runtimeOpts.add_option("-d", "--jobs-per-disk", type="int", dest='jobsPerDisk', help='Number of concurrent jobs per disk', metavar="NUM", default=3)
 runtimeOpts.add_option("-m", "--maximum-jobs", type="int", dest='maxJobs', help='Maximum number of jobs to submit', metavar="NUM", default=-1)
 parser.add_option_group(runtimeOpts)
@@ -51,10 +50,6 @@ parser.add_option("-t", "--no-submit", action="store_true", dest="noSubmit", hel
 (options, args) = parser.parse_args()
 
 # check environment
-
-localMode = False
-if 'dcmu00' in os.environ['HOSTNAME']:
-    localMode = True
 
 outputIsLFN = False
 addSuffix = True
@@ -86,9 +81,6 @@ if resubmit:
         if matches:            
             outputDir = matches.group(1)
             if outputDir[0:7] == '/store/':
-                if not localMode:
-                    raise RuntimeError("Cannot export output to /store in lxbatch mode")
-                
                 outputIsLFN = True
 
         matches = re.match('outputFiles[ ]=[ ]((?:[^,]+,?)+)', line.strip())
@@ -127,9 +119,6 @@ if resubmit:
                 fileLists[0].append(scId)
 
     if options.recover:
-        if not localMode:
-            raise RuntimeError("Cannot run --recover option in lxbatch mode")
-
         recoverList = []
         wsFiles = os.listdir(workspace)
         for idisk in range(0, ndisk):
@@ -166,9 +155,6 @@ else:
 
     outputDir = options.outputDir
     if outputDir[0:7] == '/store/':
-        if not localMode:
-            raise RuntimeError("Cannot export output to /store in lxbatch mode")
-        
         outputIsLFN = True
     elif outputDir == '':
         outputDir = '~/scratch0/' + options.jobName
@@ -212,9 +198,6 @@ else:
     
     rootpath = line[pathpos:].strip()
     
-    if options.queue not in ('1nh', '8nh', '1nd', '1nw'):
-        raise ValueError('Wrong queue name ' + options.queue)
-
     if options.externalList:
         if len(datasets) > 1:
             raise RuntimeError('Option -x (--external-list) cannot be used with multiple datasets')
@@ -288,10 +271,7 @@ else:
                 if not matches:
                     raise IOError('LFN ' + lfn + ' does not match the pattern ' + nameFormat)
         
-                if localMode:
-                    fileLists[int(matches.group(1))].append(lfn)
-                else:
-                    fileLists[int(matches.group(1))].append(url)
+                fileLists[int(matches.group(1))].append(lfn)
             
         con.close()
 
@@ -416,24 +396,14 @@ int exec('''
 
   gROOT->LoadMacro("''' + macro + '''+");
 
-  try{
-    '''
-    scriptContent += function + '('
+  ''' + function + '('
     if options.macroArguments:
         scriptContent += options.macroArguments + ', '
 
     if externalList:
-        if localMode:
-            scriptContent += '"' + datasets[0] + '", '
-        else:
-            scriptContent += '"http://' + nodeURL + '/' + datasets[0] + '", '
+        scriptContent += '"' + datasets[0] + '", '
     
     scriptContent += '''&urls, &outputFiles);
-  }
-  catch(exception& e){
-    cerr << e.what() << endl;
-    return 255;
-  }
 
   return 1;
 }
@@ -559,30 +529,10 @@ while running:
             if len(outputFiles) == 0 and addSuffix:
                 os.mkdir(pfDir[idisk] + '/' + jobId)            
     
-            if localMode:
-                logfile = file(workspace + '/' + jobId + '.log', 'w')
-                proc = subprocess.Popen(execCmd, stdout=logfile, stderr=logfile, shell=True, preexec_fn=os.setsid)
-
-                runningProcesses[idisk].append((proc, logfile))
-            else:
-                jobName = workspace[workspace.rfind('/') + 1:] + '_' + jobId
-                bsubCommand = ['bsub',
-                    '-q', options.queue,
-                    '-J', jobName,
-                    execCmd]
-                bsubp = subprocess.Popen(bsubCommand, stdout=subprocess.PIPE)
-                while bsubp.poll() is None:
-                    pass
-    
-                if bsubp.returncode != 0:
-                    raise RuntimeError('Failed submission')
-    
-                bsubstr = bsubp.stdout.readline()
-                matches = bsubPat.search(bsubstr)
-                if not matches:
-                    raise RuntimeError('bsub returned ' + bsubstr)
-    
-                runningProcesses[idisk].append((matches.group(1), jobId))
+            logfile = file(workspace + '/' + jobId + '.log', 'w')
+            proc = subprocess.Popen(execCmd, stdout=logfile, stderr=logfile, shell=True, preexec_fn=os.setsid)
+            
+            runningProcesses[idisk].append((proc, logfile))
     
             iLine[idisk] += linesPerJob
             nSubmitted += 1
@@ -595,76 +545,38 @@ while running:
     
         time.sleep(5)
 
-        if localMode:
-            for idisk in range(0, ndisk):
-                for proc,logfile in runningProcesses[idisk]:
-                    if proc.poll() is not None:
-                        runningProcesses[idisk].remove((proc, logfile))
-                        logfile.close()
+        for idisk in range(0, ndisk):
+            for proc,logfile in runningProcesses[idisk]:
+                if proc.poll() is not None:
+                    runningProcesses[idisk].remove((proc, logfile))
+                    logfile.close()
+
+                    logName = logfile.name
+                    jobId = logName[logName.rfind('/') + 1:len(logName) - 4]
+
+                    if proc.returncode == 1:
+                        os.rename(logName, logName.replace('.log', '.done'))
+                    else:
+                        os.rename(logName, logName.replace('.log', '.fail'))
+
+                    if len(outputFiles) == 0 and addSuffix:
+                        tmpDir = pfDir[idisk] + '/' + jobId
+                        for fileName in os.listdir(tmpDir):
+                            trueName = fileName[0:fileName.rfind('.')] + '_' + jobId + fileName[fileName.rfind('.'):]
+                            pfn = pfDir[idisk] + '/' + trueName
+                            os.rename(tmpDir + '/' + fileName, pfn)
+                            if outputIsLFN:
+                                os.symlink(pfn, outputDir + '/' + trueName)
     
-                        logName = logfile.name
-                        jobId = logName[logName.rfind('/') + 1:len(logName) - 4]
-    
-                        if proc.returncode == 1:
-                            os.rename(logName, logName.replace('.log', '.done'))
-                        else:
-                            os.rename(logName, logName.replace('.log', '.fail'))
-    
-                        if len(outputFiles) == 0 and addSuffix:
-                            tmpDir = pfDir[idisk] + '/' + jobId
-                            for fileName in os.listdir(tmpDir):
-                                trueName = fileName[0:fileName.rfind('.')] + '_' + jobId + fileName[fileName.rfind('.'):]
-                                pfn = pfDir[idisk] + '/' + trueName
-                                os.rename(tmpDir + '/' + fileName, pfn)
-                                if outputIsLFN:
-                                    os.symlink(pfn, outputDir + '/' + trueName)
-        
-                            os.rmdir(tmpDir)
-                        elif outputIsLFN:
-                            for fileName in outputFiles:
-                                trueName = fileName[0:fileName.rfind('.')]
-                                if addSuffix:
-                                    trueName += '_' + jobId
-    
-                                trueName += fileName[fileName.rfind('.'):]
-                                os.symlink(pfDir[idisk] + '/' + trueName, outputDir + '/' + trueName)
-        else:
-            bjobsCommand = ['bjobs', '-d']
-            bjobsp = subprocess.Popen(bjobsCommand, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            while bjobsp.poll() is None:
-                pass
-    
-            if bjobsp.returncode != 0:
-                raise RuntimeError('Failed to obtain job status')
-    
-            bjobsp.stdout.readline()
-            while True:
-                line = bjobsp.stdout.readline()
-                if not line:
-                    break
-                
-                bsubId = line.split()[0]
-                status = line.split()[2]
-                for idisk in range(0, ndisk):
-                    for bsubRet,jobId in runningProcesses[idisk]:
-                        if bsubId != bsubRet:
-                            continue
-                        
-                        runningProcesses[idisk].remove((bsubId, jobId))
-    
-                        logName = workspace + '/LSFJOB_' + bsubId
-                        if status == 'DONE':
-                            os.rename(logName, logName.append('.done'))
-                        else:
-                            os.rename(logName, logName.append('.fail'))
-                            
-                        if len(outputFiles) == 0 and addSuffix:
-                            tmpDir = outputDir + '/' + jobId
-                            for fileName in os.listdir(tmpDir):
-                                trueName = outputDir + '/' + fileName[0:fileName.rfind('.')] + '_' + jobId + fileName[fileName.rfind('.'):]
-                                os.rename(tmpDir + '/' + fileName, trueName)
-        
-                            os.rmdir(tmpDir)
+                        os.rmdir(tmpDir)
+                    elif outputIsLFN:
+                        for fileName in outputFiles:
+                            trueName = fileName[0:fileName.rfind('.')]
+                            if addSuffix:
+                                trueName += '_' + jobId
+
+                            trueName += fileName[fileName.rfind('.'):]
+                            os.symlink(pfDir[idisk] + '/' + trueName, outputDir + '/' + trueName)
     
         running = False
         for idisk in range(0, ndisk):
@@ -674,22 +586,12 @@ while running:
 
     except KeyboardInterrupt:
         for idisk in range(0, ndisk):
-            if localMode:
-                for proc,logfile in runningProcesses[idisk]:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    
-                    logfile.close()
-                    logName = logfile.name
-                    os.rename(logName, logName.replace('.log', '.term'))
-            else:
-                for bsubId,jobId in runningProcesses[idisk]:
-                    bkillCommand = ['bkill', str(bsubId)]
-                    bkillp = subprocess.Popen(bkillCommand, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                    while bkillp.poll() is None:
-                        pass
-
-                    logName = workspace + '/LSFJOB_' + bsubId
-                    os.rename(logName, logName.append('.term'))
+            for proc,logfile in runningProcesses[idisk]:
+                os.killpg(proc.pid, signal.SIGTERM)
+                
+                logfile.close()
+                logName = logfile.name
+                os.rename(logName, logName.replace('.log', '.term'))
 
         os.chmod(macro, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
         raise

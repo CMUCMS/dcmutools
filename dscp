@@ -3,11 +3,6 @@
 SOURCE=$1
 LFN=$2
 
-if [ ! -f $SOURCE ]; then
-    echo "$SOURCE not a regular file"
-    exit 1
-fi
-
 if [ -L $LFN ]; then
     echo "$LFN already exists as an LFN"
     exit 1
@@ -45,4 +40,4 @@ if [ ! -e $PFDIR ]; then
     mkdir -p $PFDIR
 fi
 
-cp $SOURCE $PFN && ln -s $PFN $LFN
+scp $SOURCE $PFN && ln -s $PFN $LFN

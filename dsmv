@@ -1,36 +1,73 @@
 #!/bin/bash
 
+NDISK=7
+
+mvdir() {
+    local sourcedir=$1
+    local destdir=$2
+
+    local sourcesuffix=${sourcedir:7:${#sourcedir}}
+    local destsuffix=${destdir:7:${#destdir}}
+    local idisk=0
+    while [ $idisk -lt $NDISK ]; do
+        local prefix=/data/disk${idisk}
+        [ ! -d $(dirname $prefix/$destsuffix) ] && mkdir -p $(dirname $prefix/$destsuffix)
+        mv $prefix/$sourcesuffix $prefix/$destsuffix
+
+        for name in $(ls $prefix/$destsuffix); do
+            if [ -L $sourcedir/$name ]; then
+                rm $sourcedir/$name
+                ln -s $prefix/$destsuffix/$name $sourcedir/$name
+            fi
+        done
+
+        idisk=$(($idisk+1))
+    done
+
+    [ ! -d $(dirname $destdir) ] && mkdir -p $(dirname $destdir)
+    mv $sourcedir $destdir
+}
+
+mvln() {
+    local source=$1
+    local dest=$2
+
+    local oldpfn=$(readlink $source)
+    local newpfn=`expr $oldpfn : '\(/data/disk[0-9]*\)'`/${dest:7:${#dest}}
+
+    local newpfdir=$(dirname $newpfn)
+    [ ! -d $newpfdir ] && mkdir -p $newpfdir
+
+    mv $oldpfn $newpfn
+
+    local newlfdir=$(dirname $dest)
+    [ ! -d $newlfdir ] && mkdir -p $newlfdir
+
+    rm $source
+    ln -s $newpfn $dest
+}
+
 SOURCE=$1
 DEST=$2
-
-if [ ! -L $SOURCE ]; then
-    echo "$SOURCE not an LFN"
-    exit 1
-fi
-
-if [ -L $DEST ]; then
-    echo "$DEST already exists as an LFN"
-    exit 1
-fi
 
 if [ "${SOURCE:0:7}" != "/store/" -o "${DEST:0:7}" != "/store/" ]; then
     echo "LFN must start from /store/"
     exit 1
 fi
 
-DESTDIR=$(dirname $DEST)
+[ $SOURCE = $DEST ] && exit 0
 
-if [ -e $DESTDIR -a ! -d $DESTDIR ]; then
-    echo "Cannot make $DESTDIR into a directory"
+
+if [ -e $DEST ]; then
+    echo "$DEST already exists"
     exit 1
 fi
 
-if [ ! -e $DESTDIR ]; then
-    mkdir -p $DESTDIR
+if [ -L $SOURCE ]; then
+    mvln $SOURCE $DEST
+elif [ -d $SOURCE ]; then
+    mvdir $SOURCE $DEST
+else
+    echo "$SOURCE neither an LFN nor a directory"
+    exit 1
 fi
-
-PFN=$(readlink $SOURCE)
-
-rm $SOURCE
-
-ln -s $PFN $DEST
