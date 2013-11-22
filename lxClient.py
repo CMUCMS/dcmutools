@@ -58,7 +58,11 @@ def downloadFiles(workspace_, jobName_, port_, queue_, exitFlag_):
         try:
             response = sock.recv(1024)
 
-            if response != 'ready': continue
+            if response == 'notfound':
+                queue_.put('term')
+                break
+            elif response != 'ready':
+                continue
     
             remoteFiles = map(str.strip, lines[iLine].split(','))
             localPaths = []
@@ -138,24 +142,33 @@ def cleanup(jobName_, remote_ = '', remotePaths_ = []):
 
 if __name__ == '__main__':
     
-    from jobconfig import jobConfig
-    
     workspace = sys.argv[1]
     jobName = sys.argv[2]
     port = int(sys.argv[3])
+    remoteOutputDir = sys.argv[4]
+
+    sys.path.append(workspace)
+
+    from jobconfig import jobConfig
     
     # read configuration
     
     macro = jobConfig['macro']
     analyzerName = jobConfig['analyzer']
-    remoteOutputDir = jobConfig['outputDir'] if len(sys.argv) == 4 else sys.argv[4]
+    analyzerArguments = jobConfig['analyzerArguments']
 
     sys.argv = []
 
     if DEBUG: print 'loading macro'
+
+    ROOT.gROOT.SetBatch()
+
+    rootlogon = ROOT.gEnv.GetValue("Rint.Logon", "")
+    if rootlogon:
+        ROOT.gROOT.Macro(rootlogon)
     
     # load ROOT source
-    for lib in jobConfig["libraries"].split(','):
+    for lib in jobConfig["libraries"]:
         ROOT.gSystem.Load(lib)
     
     ROOT.gROOT.LoadMacro(macro + '+')
@@ -184,7 +197,7 @@ if __name__ == '__main__':
     if DEBUG: print 'initialization'
 
     try:
-        if not analyzer.initialize(outputDir):
+        if not analyzer.initialize(outputDir, *analyzerArguments):
             raise RuntimeError("Worker class initialization")
     except:
         sys.exit(1)
@@ -210,7 +223,7 @@ if __name__ == '__main__':
         if not fileNames:
             break
         if fileNames == 'term':
-            abort = 'download failure'
+            abort += '(download failure)'
             exitFlag.set()
             break
     
@@ -219,7 +232,7 @@ if __name__ == '__main__':
             if not analyzer.run(fileNames):
                 raise RuntimeError("Worker")
         except:
-            abort = 'run exception'
+            abort += '(run exception)'
             exitFlag.set()
             break
 
@@ -230,12 +243,12 @@ if __name__ == '__main__':
         if not analyzer.finalize():
             raise RuntimeError("Worker class finalization")
     except:
-        abort = 'finalize exception'
+        abort += '(finalize exception)'
         exitFlag.set()
 
     remotePaths = []
     if not abort and not cleanup(jobName, remoteOutputDir, remotePaths):
-        abort = "final cleanup"
+        abort += '(final cleanup)'
         exitFlag.set()
 
     if DEBUG: print 'remote paths: ', remotePaths
@@ -244,7 +257,10 @@ if __name__ == '__main__':
        sock = openConnection(jobName, port)
        if not sock: continue
        try:
-           sock.recv(1024)
+           response = sock.recv(1024)
+           if response != 'ready':
+               abort += '(server failure)'
+               break
            if abort:
                sock.send('fail')
                sock.recv(1024)
