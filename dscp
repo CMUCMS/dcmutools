@@ -40,4 +40,4 @@ if [ ! -e $PFDIR ]; then
     mkdir -p $PFDIR
 fi
 
-scp $SOURCE $PFN && ln -s $PFN $LFN
+scp -oStrictHostKeyChecking=no $SOURCE $PFN && ln -s $PFN $LFN
