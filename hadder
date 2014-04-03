@@ -1,16 +1,36 @@
 #!/bin/bash
 
+DCMUHOST=dcmu00
+
 secure_copy(){
-    TARGET=$1
-    DESTINATION=$2
+    TARGETPATH=$1
+    DESTINPATH=$2
 
     MESSAGE=""
-    if [ -e $TARGET ]; then
-        scp -oStrictHostKeyChecking=no $TARGET $DESTINATION
+    if [ -e $TARGETPATH ]; then
+        scp -oStrictHostKeyChecking=no $TARGETPATH $DESTINPATH
         if [ $? -eq 0 ]; then
-            rm $TARGET
+            rm $TARGETPATH
         else
-            MESSAGE="Copy of "$(basename $TARGET)" failed"
+            MESSAGE="Copy of "$(basename $TARGETPATH)" failed"
+        fi
+    fi
+
+    echo $MESSAGE
+}
+
+dcmu_copy(){
+    TOOLSPATH=$1
+    TARGETPATH=$2
+    DESTINPATH=$3
+
+    MESSAGE=""
+    if [ -e $TARGETPATH ]; then
+        ssh -oStrictHostKeyChecking=no $DCMUHOST "$TOOLSPATH/dscp $HOSTNAME:$TARGETPATH $DESTINPATH"
+        if [ $? -eq 0 ]; then
+            rm $TARGETPATH
+        else
+            MESSAGE="Copy of "$(basename $TARGETPATH)" failed"
         fi
     fi
 
@@ -48,96 +68,155 @@ while [ $# -ne 3 ]; do
     esac
 done
 
+TOOLSDIR=$(dirname $0)
 CMSSW_BASE=$1
 DESTINATION=$2
 LOGFILE=$3
 
 while true; do
-    OUTPUTDIR=/tmp/$USER/$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
+    # some oddity when using pipe from subprocess; use temporary files
+    head -c 100 < /dev/urandom > /tmp/${USER}/rand
+    tr -dc 'a-zA-Z0-9' < /tmp/${USER}/rand > /tmp/${USER}/rand2
+    fold -w 6 < /tmp/${USER}/rand2 > /tmp/${USER}/rand
+    OUTPUTDIR=/tmp/${USER}/$(head -n 1 < /tmp/${USER}/rand)
+    rm /tmp/${USER}/rand /tmp/${USER}/rand2
+    echo "mkdir $OUTPUTDIR > /dev/null 2>&1 && break"
     mkdir $OUTPUTDIR > /dev/null 2>&1 && break
 done
 
-echo $HOSTNAME:$OUTPUTDIR
+echo ${HOSTNAME}:${OUTPUTDIR}
 
 exec 3>&1
 exec 1>$LOGFILE 2>&1
 
-echo "hadder $HOSTNAME:$OUTPUTDIR"
+echo "hadder ${HOSTNAME}:${OUTPUTDIR}"
 echo "CMSSW_BASE $CMSSW_BASE"
+
+DCMU=0
+if [[ $DESTINATION =~ "^${DCMUHOST}[^/]*/store.*" ]]; then
+    DCMU=1
+    DESTINATION=$(echo $DESTINATION | sed 's|^[^/]*\(/.*\)|\1|')
+    echo "DCMU mode ON"
+fi
 
 CWD=$PWD
 cd $CMSSW_BASE
+/afs/cern.ch/cms/common/scramv1 runtime -sh || exit 1
 eval `/afs/cern.ch/cms/common/scramv1 runtime -sh` || exit 1
 cd $CWD
 
 if [ $MERGEALL -eq 1 ]; then
     # target directory and target name
-    TARGETDIR=$OUTPUTDIR/output
-    TARGETBASE=$TARGETDIR/${NAMEBASE}
-    INDEX=0
-    TARGET=${TARGETBASE}_${INDEX}.root
+    TARGETDIR=${OUTPUTDIR}/output
+    TARGETBASE=$NAMEBASE
 fi
 
 while read -a INPUT; do
     JOBGROUP="${INPUT[0]}"
     ROOTFILE="${INPUT[1]}"
 
+    echo "$JOBGROUP $ROOTFILE"
+
     # blank line -> return
-    [ -z "$JOBGROUP" ] && break
+    if [ -z "$JOBGROUP" ]; then
+	echo "Exiting merge loop"
+	break
+    fi
 
     if [ $MERGEALL -eq 0 ]; then
         # target directory and target name
-        TARGETDIR=$OUTPUTDIR/$JOBGROUP
-        TARGETBASE=$TARGETDIR/${NAMEBASE}_${JOBGROUP}
+        TARGETDIR=${OUTPUTDIR}/${JOBGROUP}
+        TARGETBASE=${NAMEBASE}_${JOBGROUP}
     fi
 
     if [ ! -d $TARGETDIR ]; then
         # if the target directory does not exist, create one
+        echo "mkdir $TARGETDIR 2>&1 || continue"
         mkdir $TARGETDIR 2>&1 || continue
-        echo "0" > $TARGETDIR/merged
-        echo "0" > $TARGETDIR/index
+        echo "0" > ${TARGETDIR}/merged
+        echo "0" > ${TARGETDIR}/index
     fi
 
-    INDEX=$(cat $TARGETDIR/index)
-    TARGET=${TARGETBASE}_${INDEX}.root
+    INDEX=$(cat ${TARGETDIR}/index)
+    MERGED=$(cat ${TARGETDIR}/merged)
+
+    TARGETFILE=${TARGETBASE}_${INDEX}.root
+    TARGETPATH=${TARGETDIR}/${TARGETFILE}
 
     MESSAGE=""
 
     if [ -z "$ROOTFILE" ]; then
         if [ $MERGEALL -eq 0 ]; then
-            # input with only the job group name signals the end or processing for the group
+            # input with only the job group name signals the end of processing for the group
             if [ $INDEX -eq 0 ]; then
-                NEWTARGET=${TARGETBASE}.root
-                mv $TARGET $NEWTARGET
-                TARGET=$NEWTARGET
+                echo "mv $TARGETPATH ${TARGETDIR}/${TARGETBASE}.root"
+                mv $TARGETPATH ${TARGETDIR}/${TARGETBASE}.root
+                TARGETFILE=${TARGETBASE}.root
+                TARGETPATH=${TARGETDIR}/${TARGETFILE}
             fi
-            MESSAGE=$(secure_copy $TARGET $DESTINATION)
+
+            if [ $DCMU -eq 0 ]; then
+                echo "secure_copy $TARGETPATH ${DESTINATION}/${TARGETFILE}"
+                MESSAGE=$(secure_copy $TARGETPATH ${DESTINATION}/${TARGETFILE})
+            else
+                echo "dcmu_copy $TOOLSDIR $TARGETPATH ${DESTINATION}/${TARGETFILE}"
+                MESSAGE=$(dcmu_copy $TOOLSDIR $TARGETPATH ${DESTINATION}/${TARGETFILE})
+            fi
         fi
     else
-        if [ -e $TARGET ]; then
+        if [ -e $TARGETPATH ]; then
             # target already exists -> do merge and increment the counters
-            hadd $TARGETDIR/tmp.root $TARGET $ROOTFILE
+            echo "hadd ${TARGETDIR}/tmp.root $TARGETPATH $ROOTFILE"
+            hadd ${TARGETDIR}/tmp.root $TARGETPATH $ROOTFILE
+
             if [ $? -eq 0 ]; then
-                mv $TARGETDIR/tmp.root $TARGET
+                echo "mv ${TARGETDIR}/tmp.root $TARGETPATH"
+                mv ${TARGETDIR}/tmp.root $TARGETPATH
+                echo "rm $ROOTFILE"
                 rm $ROOTFILE
 
-                MERGED=$(($(cat $TARGETDIR/merged) + 1))
-                if [ $MERGED -eq $MAXNUM -o $(du -m $TARGET | awk '{print $1}') -gt $MAXSIZE ]; then
-                    MESSAGE=$(secure_copy $TARGET $DESTINATION)
+                MERGED=$(($MERGED + 1))
+                if [ $MERGED -eq $MAXNUM -o $(du -m $TARGETPATH | awk '{print $1}') -gt $MAXSIZE ]; then
+                    if [ $DCMU -eq 0 ]; then
+                        echo "secure_copy $TARGETPATH ${DESTINATION}/${TARGETFILE}"
+                        MESSAGE=$(secure_copy $TARGETPATH ${DESTINATION}/${TARGETFILE})
+                    else
+                        echo "dcmu_copy $TOOLSDIR $TARGETPATH ${DESTINATION}/${TARGETFILE}"
+                        MESSAGE=$(dcmu_copy $TOOLSDIR $TARGETPATH ${DESTINATION}/${TARGETFILE})
+                    fi
 
-                    echo $(($INDEX + 1)) > $TARGETDIR/index
-                    echo "0" > $TARGETDIR/merged
+                    echo $(($INDEX + 1)) > ${TARGETDIR}/index
+                    echo "0" > ${TARGETDIR}/merged
                 else
-                    echo $MERGED > $TARGETDIR/merged
+                    echo $MERGED > ${TARGETDIR}/merged
                 fi
             else
-                rm $TARGETDIR/tmp.root
+                echo "rm ${TARGETDIR}/tmp.root"
+                rm ${TARGETDIR}/tmp.root
                 MESSAGE="File "$(basename $ROOTFILE)" could not be merged"
             fi
         else
             # create target
-            mv $ROOTFILE $TARGET
-            echo "1" > $TARGETDIR/merged
+            echo "mv $ROOTFILE $TARGETPATH"
+            mv $ROOTFILE $TARGETPATH
+
+            if [ $? -eq 0 ]; then
+		MERGED=$(($MERGED + 1))
+		if [ $MERGED -eq $MAXNUM -o $(du -m $TARGETPATH | awk '{print $1}') -gt $MAXSIZE ]; then
+		    if [ $DCMU -eq 0 ]; then
+			echo "secure_copy $TARGETPATH ${DESTINATION}/${TARGETFILE}"
+			MESSAGE=$(secure_copy $TARGETPATH ${DESTINATION}/${TARGETFILE})
+		    else
+			echo "dcmu_copy $TOOLSDIR $TARGETPATH ${DESTINATION}/${TARGETFILE}"
+			MESSAGE=$(dcmu_copy $TOOLSDIR $TARGETPATH ${DESTINATION}/${TARGETFILE})
+		    fi
+
+		    echo $(($INDEX + 1)) > ${TARGETDIR}/index
+		    echo "0" > ${TARGETDIR}/merged
+		else
+		    echo $MERGED > ${TARGETDIR}/merged
+                fi
+	    fi
         fi
     fi
 
@@ -145,17 +224,27 @@ while read -a INPUT; do
 done
 
 if [ $MERGEALL -eq 1 ]; then
-    if [ $INDEX -eq 0 ]; then
-        NEWTARGET=${TARGETBASE}.root
-        mv $TARGET $NEWTARGET
-        TARGET=$NEWTARGET
-    fi
-    MESSAGE=$(secure_copy $TARGET $DESTINATION)
-    if [ -z "$MESSAGE" ]; then
-        MESSAGE="haddder finished"
+    if [ $INDEX -ne 0 -o $MERGED -ne 0 ]; then
+	if [ $INDEX -eq 0 ]; then
+            mv $TARGETPATH ${TARGETDIR}/${TARGETBASE}.root
+	    TARGETFILE=${TARGETBASE}.root
+            TARGETPATH=${TARGETDIR}/${TARGETFILE}
+	fi
+
+	if [ $DCMU -eq 0 ]; then
+            echo "secure_copy $TARGETPATH ${DESTINATION}/${TARGETFILE}"
+            MESSAGE=$(secure_copy $TARGETPATH ${DESTINATION}/${TARGETFILE})
+	else
+            echo "dcmu_copy $TOOLSDIR $TARGETPATH ${DESTINATION}/${TARGETFILE}"
+            MESSAGE=$(dcmu_copy $TOOLSDIR $TARGETPATH ${DESTINATION}/${TARGETFILE})
+	fi
+	
+	if [ -z "$MESSAGE" ]; then
+            MESSAGE="hadder finished"
+	fi
     fi
 else
-    MESSAGE="haddder finished"
+    MESSAGE="hadder finished"
 fi
 
 exec 1>&3 3>&-

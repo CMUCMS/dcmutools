@@ -10,7 +10,6 @@ import time
 import signal
 import shutil
 import string
-import random
 import SocketServer
 import subprocess
 
@@ -20,7 +19,9 @@ TIMEOUT = 30
 MINPORT = 40000
 MAXPORT = 40009
 MAXCONN = 200
-LXPLUS = "lxplus5"
+DCMUHOST = "dcmu00"
+LXPLUS = "lxplus"
+CMSSW_BASE = "/afs/cern.ch/user/y/yiiyama/cmssw/SLC6Ntuplizer5314"
 USER = os.environ['USER']
 
 DEBUG = False
@@ -55,6 +56,9 @@ def countJobs(jobList_, mask_ = (CREATED, SUBMITTED, RUNNING, DONE, FAILED, SUCC
         return 0
     
     return len(filter(lambda item: item[1][1] in mask_, jobList_.items()))
+
+def ignoreSIGINT():
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 class JobListManager:
     """
@@ -205,12 +209,12 @@ class DispatchServer:
         """
 
         def __init__(self, addr_):
-            SocketServer.TCPServer.__init__(self, addr_, DispatchServer.DownloadRequestHandler)
-
             self.jobLists = JobListManager()
             self.queues = {}
 
             self.timeout = TIMEOUT
+
+            SocketServer.TCPServer.__init__(self, addr_, DispatchServer.DownloadRequestHandler)
 
         def __del__(self):
             for jobGroup in self.queues.keys():
@@ -231,11 +235,14 @@ class DispatchServer:
                 pass
 
         def verify_request(self, request_, clientAddr_):
-            if reduce(lambda x, y: x + y, map(Queue.Queue.qsize, self.queues.values())) > MAXCONN:
-                if DEBUG: print 'Request queues are full. Denying access from ', clientAddr_
+            try:
+                if reduce(lambda x, y: x + y, map(Queue.Queue.qsize, self.queues.values())) > MAXCONN:
+                    if DEBUG: print 'Request queues are full. Denying access from ', clientAddr_
+                    raise RuntimeError('Too many connections in queue')
+                else:
+                    return True
+            except:
                 return False
-            else:
-                return True
 
         def process_request(self, request_, clientAddr_):
             """
@@ -283,9 +290,13 @@ class DispatchServer:
 
             signal.alarm(5)
             try:
-                matches = re.match('([a-zA-Z0-9_.-]+)[:]([a-zA-Z0-9_/.-]+)', proc.stdout.readline().strip())
+                response = proc.stdout.readline().strip()
+                if DEBUG: print response
+                matches = re.match('([a-zA-Z0-9_.-]+)[:]([a-zA-Z0-9_/.-]+)', response)
                 while matches is None:
-                    matches = re.match('([a-zA-Z0-9_.-]+)[:]([a-zA-Z0-9_/.-]+)', proc.stdout.readline().strip())
+                    response = proc.stdout.readline().strip()
+                    if DEBUG: print response
+                    matches = re.match('([a-zA-Z0-9_.-]+)[:]([a-zA-Z0-9_/.-]+)', response)
 
                 proc.stdin.write('\n')
                 while proc.poll() is None: pass
@@ -303,7 +314,9 @@ class DispatchServer:
     
             if DEBUG: print 'reducer function confirmed. Starting on SSH'
     
-            self._proc = subprocess.Popen("{ssh} {host} '{command}'".format(ssh = SSH, host = LXPLUS, command = command), shell = True, stdout = subprocess.PIPE, stdin = subprocess.PIPE, stderr = subprocess.STDOUT)
+            self._proc = subprocess.Popen("{ssh} {host} '{command}'".format(ssh = SSH, host = LXPLUS, command = command), shell = True,
+                stdout = subprocess.PIPE, stdin = subprocess.PIPE, stderr = subprocess.STDOUT,
+                preexec_fn = ignoreSIGINT)
 
             matches = re.match('([a-zA-Z0-9_.-]+)[:]([a-zA-Z0-9_/.-]+)', self._proc.stdout.readline().strip())
             while matches is None:
@@ -355,8 +368,12 @@ class DispatchServer:
         def open(self):
 
             if self._term and self._term.poll() is None: return
-            self._term = subprocess.Popen("{ssh} -T {host}".format(ssh = SSH, host = LXPLUS), shell = True, stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
-
+            self._term = subprocess.Popen("{ssh} -T {host}".format(ssh = SSH, host = LXPLUS), shell = True,
+                stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.STDOUT,
+                preexec_fn = ignoreSIGINT)
+            response = self.communicate('echo $HOSTNAME')
+            print 'Terminal opened on ' + response[0]
+            
         def close(self, force_ = False):
 
             if not self._term or self._term.poll() is not None: return
@@ -432,7 +449,6 @@ class DispatchServer:
         If workspace already exists, config_ will be overridden by the job configuration saved in jobConfig.py.
         After the workspace has been set up, the function performs the following checks:
          - ROOT macro integrity
-         - Output directory existence
          - Server port availability
         """
         
@@ -449,12 +465,11 @@ class DispatchServer:
             os.mkdir(self._workspace + '/inputs')
             os.mkdir(self._workspace + '/logs')
 
-            with open(self._workspace + '/jobconfig.py', 'w') as configFile:
-                configFile.write('jobConfig = ' + str(config_) + '\n')
+        self._outputDir = config_["outputDir"]
     
         # check source
         macro = config_["macro"]
-        print 'Checking and compiling ' + macro
+        print 'Checking ' + macro
         if os.path.exists(macro):
             with open(macro) as macroFile:
                 for line in macroFile:
@@ -464,45 +479,6 @@ class DispatchServer:
         else:
             raise RuntimeError("Macro not found")
     
-        # compile the source
-        if DEBUG: print "setting up ROOT environment"
-
-        import ROOT
-        ROOT.gROOT.SetBatch()
-    
-        rootlogon = ROOT.gEnv.GetValue("Rint.Logon", "")
-        if rootlogon:
-            ROOT.gROOT.Macro(rootlogon)
-    
-        for lib in config_["libraries"]:
-            ROOT.gSystem.Load(lib)
-    
-        if config_["includePaths"]:
-            ROOT.gSystem.AddIncludePath(config_["includePaths"])
-    
-        if DEBUG: print "compiling macro"
-    
-        ROOT.gROOT.LoadMacro(macro + '+')
-
-        # is the macro properly loaded? (LoadMacro in pyROOT somehow always returns 0)
-        getattr(ROOT, config_["analyzer"])
-
-        del ROOT
-    
-        # check output directory
-        self._outputDir = config_["outputDir"]
-        if ':' in self._outputDir:
-            host, dir = tuple(self._outputDir.split(':'))
-            sshProc = subprocess.Popen("{ssh} {host} '[ -d {dir} ]'".format(ssh = SSH, host = host, dir = dir), shell = True)
-            while sshProc.poll() is None: time.sleep(1)
-    
-            dirExists = (sshProc.returncode == 0)
-        else:
-            dirExists = os.path.isdir(self._outputDir)
-    
-        if not dirExists:
-            raise RuntimeError("output directory not found")
-
         # check port availability and start server
         port = MINPORT
         while port <= MAXPORT:
@@ -514,6 +490,7 @@ class DispatchServer:
         else:
             raise RuntimeError("Allowed ports all in use")
 
+        # set setenv command
         if config_['setenv']:
             self._setenv = config_['setenv'] + ';'
         else:
@@ -531,7 +508,51 @@ class DispatchServer:
 
         self._jobThreads = []
 
+        # open terminal
         self._terminal = DispatchServer.Terminal()
+    
+        # compile the source in the terminal
+        if DEBUG: print "writing compile code"
+
+        with open(self._workspace + '/macro.py', 'w') as configFile:
+            configFile.write('import sys\n')
+            configFile.write('import ROOT\n')
+	    configFile.write('ROOT.gROOT.SetBatch()\n')
+            configFile.write('rootlogon = ROOT.gEnv.GetValue("Rint.Logon", "")\n')
+            configFile.write('if rootlogon:\n')
+            configFile.write('    ROOT.gROOT.Macro(rootlogon)\n')
+            for lib in config_["libraries"]:
+                configFile.write('ROOT.gSystem.Load("' + lib + '")\n')
+            configFile.write('ROOT.gSystem.AddIncludePath("' + config_["includePaths"] + '")\n')
+            configFile.write('if ROOT.gROOT.LoadMacro("' + macro + '+") != 0: sys.exit(1)\n')
+
+            configFile.write('arguments = (')
+            for arg in config_['analyzerArguments'].split(','):
+                arg = arg.strip()
+                if not arg: continue
+                try:
+                    eval(arg)
+                    configFile.write(arg + ', ')
+                except NameError:
+                    if arg == 'true':
+                        configFile.write('True, ')
+                    elif arg == 'false':
+                        configFile.write('False, ')
+                    else:
+                        # likely is an enum defined in the macro
+                        configFile.write('getattr(ROOT, "' + arg + '"), ')
+
+            configFile.write(')\n')
+
+        with open(self._workspace + '/jobconfig.py', 'w') as configFile:
+	    configFile.write('jobConfig = ' + str(config_))
+    
+        response = self._terminal.communicate(self._setenv + 'cd ' + self._workspace + ';python macro.py > logs/compile.log 2>&1')
+
+        with open(self._workspace + '/logs/compile.log', 'r') as logFile:
+            for line in logFile:
+                if 'Error' in line or 'fail' in line:
+                    raise RuntimeError("Compilation failed")
 
         if DEBUG: print 'exiting server Ctor'
 
@@ -598,6 +619,7 @@ class DispatchServer:
             self._exitFlag.set()
             for thread in self._jobThreads:
                 thread.join()
+                print 'Thread ' + thread.name + ' terminated'
 
             if DEBUG: print 'all job threads joined'
 
@@ -856,13 +878,20 @@ class DispatchServer:
 if __name__ == '__main__':
 
     try:
+        if DCMUHOST not in os.environ['HOSTNAME']:
+            raise EnvironmentError
+    except:
+        print "This is not ", DCMUHOST
+        raise
+
+    try:
         if 'bash' not in os.environ['SHELL']:
             raise EnvironmentError
     except:
-        print "Only bash supported as the default shell"
+        print "Only bash supported"
 	raise
 
-    SETENV = 'cd ' + os.environ['CMSSW_BASE'] + ';eval `scramv1 runtime -sh`'
+    SETENV = 'cd ' + CMSSW_BASE + ';eval `scramv1 runtime -sh`'
 
     from optparse import OptionParser, OptionGroup
 
@@ -872,7 +901,7 @@ if __name__ == '__main__':
     execOpts.add_option("-w", "--workspace", dest='workspace', help='Name of the job directory', default="", metavar="DIR")
     execOpts.add_option("-e", "--setenv", dest='setenv', help='Command to issue before running the job', default=SETENV, metavar="CMD")
     execOpts.add_option("-a", "--analyzer-arguments", dest='analyzerArguments', help="Arguments to be passed to the initialize() function of the analyzer object.", default="", metavar="ARGS")
-    execOpts.add_option("-I", "--include", dest="includePaths", help="Include path for compilation (CMSSW workspace is automatically added)", default="", metavar="-IDIR1 [-IDIR2 [-IDIR3 ...]]")
+    execOpts.add_option("-I", "--include", dest="includePaths", help="Include path for compilation", default="", metavar="-IDIR1 [-IDIR2 [-IDIR3 ...]]")
     execOpts.add_option("-l", "--lib", dest="libraries", help="Libraries to load", default="", metavar="LIB1[,LIB2[,LIB3...]]")
     execOpts.add_option("-o", "--output-dir", dest="outputDir", help="Output directory", default=".", metavar="OUT")
     execOpts.add_option("-m", "--reduceCmd", dest="reduceCmd", help="Reducer command. The command will be invoked with the output directory and log file names as the last two arguments. The executable is expected to parse the input file names from stdin and return the path of the reduced file on returning. The end of input is signaled by a blank line.", default="", metavar="EXECUTABLE")
@@ -951,37 +980,7 @@ Each instance of the match is passed to the worker function. Example: susyEvents
         else:
             jobConfig["libraries"] = []
 
-        if options.analyzerArguments.strip():
-            analyzerArgs = []
-            for arg in options.analyzerArguments.strip().split(','):
-                arg = arg.strip()
-                if '"' in arg:
-                    analyzerArgs.append(arg.replace('"', ''))
-                elif arg == 'true':
-                    analyzerArgs.append(True)
-                elif arg == 'false':
-                    analyzerArgs.append(False)
-                else:
-                    try:
-                        analyzerArgs.append(float(arg))
-                    except ValueError:
-                        # likely is an enum defined in the macro
-                        import ROOT
-                        ROOT.gROOT.SetBatch()
-                        rootlogon = ROOT.gEnv.GetValue("Rint.Logon", "")
-                        if rootlogon:
-                            ROOT.gROOT.Macro(rootlogon)
-                        for lib in jobConfig["libraries"]:
-                            ROOT.gSystem.Load(lib)
-                        if jobConfig["includePaths"]:
-                            ROOT.gSystem.AddIncludePath(jobConfig["includePaths"])
-
-                        ROOT.gROOT.LoadMacro(jobConfig["macro"] + "+")
-                        analyzerArgs.append(getattr(ROOT, arg))
-
-                        del ROOT
-
-            jobConfig["analyzerArguments"] = tuple(analyzerArgs)
+        jobConfig["analyzerArguments"] = options.analyzerArguments.strip()
             
         jobConfig["outputDir"] = options.outputDir.strip()
         jobConfig["reduceCmd"] = options.reduceCmd.strip()
@@ -1068,7 +1067,10 @@ Each instance of the match is passed to the worker function. Example: susyEvents
 	    jobNames = map(lambda name: name.replace("inputs/", ""), glob.glob('inputs/{0}_*'.format(diskName)))
 
 	if len(specified) > 0:
-	    jobNames = filter(lambda name: name in specified, jobNames)
+            filtered = []
+            for spec in specified:
+                filtered += filter(lambda name: re.match(spec.replace('*', '.*'), name) is not None, jobNames)
+	    jobNames = filtered
 
 	if len(jobNames) == 0:
 	    print 'No jobs to submit for {0}. Skipping.'.format(diskName)

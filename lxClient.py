@@ -14,7 +14,7 @@ SERVERHOST = 'dcmu00'
 TMPDIR = os.environ['TMPDIR']
 TIMEOUT = 600
 
-DEBUG = True
+DEBUG = False
 
 def openConnection(jobName_, port_):
 
@@ -110,6 +110,7 @@ def cleanup(jobName_, remote_ = '', remotePaths_ = []):
     try:
         shutil.rmtree(inputDir, ignore_errors = True)
     except:
+        print sys.exc_info()
         status = False
 
     if os.path.exists(outputDir) and remote_:
@@ -118,21 +119,33 @@ def cleanup(jobName_, remote_ = '', remotePaths_ = []):
             fullPath = outputDir + '/' + file
             if not os.path.isfile(fullPath): continue
 
-            remoteFullPath = remote_ + '/' + file[0:file.rfind('.')] + '_' + jobName_ + file[file.rfind('.'):]
+            if ':' in remote_:
+                (host, path) = tuple(remote_.split(':'))
+            else:
+                host = ''
+                path = remote_
 
-            scpProc = subprocess.Popen(['scp', '-oStrictHostKeyChecking=no', fullPath, remoteFullPath], stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
-            while scpProc.poll() is None: time.sleep(2)
+            remoteFullPath = path + '/' + file[0:file.rfind('.')] + '_' + jobName_ + file[file.rfind('.'):]
 
-            if scpProc.returncode != 0:
+            if host == 'eos':
+                copyProc = subprocess.Popen(['cmsStage', fullPath, remoteFullPath], stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
+            else:
+		if host: remoteFullPath = host + ':' + remoteFullPath
+                copyProc = subprocess.Popen(['scp', '-oStrictHostKeyChecking=no', fullPath, remoteFullPath], stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
+
+            while copyProc.poll() is None: time.sleep(2)
+
+            if copyProc.returncode != 0:
                 print 'copy of ' + file + ' failed'
                 status = False
-                break
+                break                
 
             remotePaths_.append(remoteFullPath)
 
     try:
         shutil.rmtree(outputDir, ignore_errors = True)
     except:
+        print sys.exc_info()
         status = False
 
     if DEBUG: print 'cleanup for {0} complete'.format(jobName_)
@@ -147,37 +160,21 @@ if __name__ == '__main__':
     port = int(sys.argv[3])
     remoteOutputDir = sys.argv[4]
 
+    sys.argv = []
+
     sys.path.append(workspace)
 
-    from jobconfig import jobConfig
+    if DEBUG: print 'loading config'
+
+    import jobconfig
+    import macro
     
     # read configuration
     
-    macro = jobConfig['macro']
-    analyzerName = jobConfig['analyzer']
-    analyzerArguments = jobConfig['analyzerArguments']
-
-    sys.argv = []
-
-    if DEBUG: print 'loading macro'
-
-    ROOT.gROOT.SetBatch()
-
-    rootlogon = ROOT.gEnv.GetValue("Rint.Logon", "")
-    if rootlogon:
-        ROOT.gROOT.Macro(rootlogon)
-    
-    # load ROOT source
-    for lib in jobConfig["libraries"]:
-        ROOT.gSystem.Load(lib)
-    
-    ROOT.gROOT.LoadMacro(macro + '+')
-
     if DEBUG: print 'analyzer class instantiation'
-    
+
     # instantiate the analyzer class
-    
-    analyzer = getattr(ROOT, analyzerName)()
+    analyzer = getattr(ROOT, jobconfig.jobConfig['analyzer'])()
     
     # clean input and output directories
 
@@ -197,9 +194,10 @@ if __name__ == '__main__':
     if DEBUG: print 'initialization'
 
     try:
-        if not analyzer.initialize(outputDir, *analyzerArguments):
+        if not analyzer.initialize(outputDir, *macro.arguments):
             raise RuntimeError("Worker class initialization")
     except:
+        print sys.exc_info()
         sys.exit(1)
     
     # thread off the downloader function
@@ -232,6 +230,7 @@ if __name__ == '__main__':
             if not analyzer.run(fileNames):
                 raise RuntimeError("Worker")
         except:
+            print sys.exc_info()
             abort += '(run exception)'
             exitFlag.set()
             break
@@ -243,6 +242,7 @@ if __name__ == '__main__':
         if not analyzer.finalize():
             raise RuntimeError("Worker class finalization")
     except:
+        print sys.exc_info()
         abort += '(finalize exception)'
         exitFlag.set()
 
@@ -267,7 +267,7 @@ if __name__ == '__main__':
            else:
                sock.send('done')
                sock.recv(1024)
-               if jobConfig["reduceCmd"]:
+               if jobconfig.jobConfig["reduceCmd"]:
                    for path in remotePaths:
                        sock.send(path)
                        sock.recv(1024)
@@ -276,7 +276,7 @@ if __name__ == '__main__':
 
            break
        except:
-           print 'communication error at the end of job. retrying.'
+           print 'communication error at the end of job. retrying.', sys.exc_info()
        finally:
            sock.close()
     
