@@ -285,6 +285,8 @@ if __name__ == '__main__':
         outputContents = os.listdir(outputDir)
         
         if jobConfig['reducer'] != 'None' and len(outputContents) == 1:
+            log('Copying output to', jobConfig['serverHost'])
+            
             localPath = outputDir + '/' + outputContents[0]
     
             remoteFileName = jobConfig['outputFile']
@@ -297,31 +299,15 @@ if __name__ == '__main__':
 #            if DEBUG: log(ServerConnection.host + ' says ' + response)
 #            remotePath = response + '/' + remoteFileName
 # Choosing to run reducer "offline" and not as a service; adds stability with a price of little time rag after the jobs are done. darun jobs will upload the output to $TMPDIR/{key}
-            remotePath = jobConfig['serverTmpDir'] + '/' + jobConfig['key'] + '/input/' + remoteFileName
+            remotePath = jobConfig['serverTmpDir'] + '/' + jobConfig['key'] + '/reduce/input/' + remoteFileName
 
-            log('Copying output to', jobConfig['serverHost'] + ':' + remotePath)
+            copyCommands = [SCP + [localPath, jobConfig['serverHost'] + ':' + remotePath]]
             
-            copyProc = subprocess.Popen(SCP + [localPath, jobConfig['serverHost'] + ':' + remotePath], stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
-    
-            while copyProc.poll() is None: time.sleep(2)
-    
-            if copyProc.returncode == 0:
-                if DEBUG: log(remoteFileName)
-#                conn.sock.send(remoteFileName)
-#                response = conn.sock.recv(1024)
-#                if DEBUG: log(ServerConnection.host + ' says ' + response)
-#                if response == 'FAILED':
-#                    raise RuntimeError('copy failure')
-#                conn = None
-            else:
-                if DEBUG: log('FAIL')
-#                conn.sock.send('FAIL')
-#                conn.sock.recv(1024)
-#                conn = None
-
-                raise RuntimeError('copy failure')
-                            
         else:
+            log('Copying output to', jobConfig['outputNode'])
+
+            copyCommands = []
+            
             for localFileName in outputContents:
                 localPath = outputDir + '/' + localFileName
     
@@ -329,18 +315,39 @@ if __name__ == '__main__':
                 remoteFileName = remoteFileName[0:remoteFileName.rfind('.')] + '_' + jobName + remoteFileName[remoteFileName.rfind('.'):]
     
                 remotePath = jobConfig['outputDir'] + '/' + remoteFileName
-
-                log('Copying output to', jobConfig['outputNode'] + ':' + remotePath)
-                
+               
                 if jobConfig['outputNode'] == 'eos':
-                    copyProc = subprocess.Popen(['cmsStage', localPath, remotePath], stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
+                    copyCommands.append(['cmsStage', localPath, remotePath])
                 else:
-                    copyProc = subprocess.Popen(SCP + [localPath, jobConfig['outputNode'] + ':' + remotePath], stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
-    
+                    copyCommands.append(SCP + [localPath, jobConfig['outputNode'] + ':' + remotePath])
+
+        for command in copyCommands:
+            iTry = 0
+            while iTry < 3:
+                copyProc = subprocess.Popen(command, stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
                 while copyProc.poll() is None: time.sleep(2)
-    
-                if copyProc.returncode != 0:
-                    raise RuntimeError('copy failure')
+        
+                if copyProc.returncode == 0:
+                    if DEBUG: log(command)
+
+#                    conn.sock.send(remoteFileName)
+#                    response = conn.sock.recv(1024)
+#                    if DEBUG: log(ServerConnection.host + ' says ' + response)
+#                    conn = None
+#                    if response == 'FAILED':
+#                        continue
+                        
+                    break
+                else:
+                    if DEBUG: log(command, 'failed')
+
+#                    conn.sock.send('FAIL')
+#                    conn.sock.recv(1024)
+#                    conn = None
+
+                iTry += 1
+            else:
+                raise RuntimeError('copy failure')
     
         # report to dispatcher
     

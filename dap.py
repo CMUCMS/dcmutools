@@ -28,7 +28,7 @@ PORT = 40000
 DCMUHOST = "dcmu00"
 TERMNODE = 'lxplus'
 CMSSW_BASE = "/afs/cern.ch/user/y/yiiyama/cmssw/SLC6Ntuplizer5314"
-HTMLDIR = '/var/www/html/jobstat'
+HTMLDIR = '/afs/cern.ch/user/y/yiiyama/www/dcmu00'
 USER = os.environ['USER']
 try:
     TMPDIR = os.environ['TMPDIR']
@@ -38,99 +38,45 @@ except KeyError:
 DEBUG = False
 SERVERONLY = False # for debugging purpose
 
-def ignoreSIGINT():
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-
-class DelegatingRequestHandler(SocketServer.BaseRequestHandler):
-    """
-    TCP request handler that delegates the actual tasks to registered servers.
-    """
-
-    def handle(self):
-        try:
-            jobName, service = self.server.requestManager.getReqInfo(self.request)
-            if DEBUG: self.server.log('Passing', jobName, 'to', service.name)
-            service.serve(self.request, jobName)
-        except:
-            if DEBUG: self.server.log('RequestHandler exception', sys.exc_info()[0:2])
-            try:
-                self.request.send('REJECT')
-            except:
-                pass
-      
 
 class DelegatingTCPServer(SocketServer.ThreadingTCPServer):
     """
     Threading TCP server with list of services to be provided. Each client must provide the verification key and declare the necessary
     service during the initial handshake.
+    The implementation does not follow the original design concept of SocketServer in that no RequestHandlerClass is used.
+    This is to eliminate the communication cost between the server and the handler object.
     """
 
-    class RequestManager(object):
-        def __init__(self, server_):
-            self._requests = {}
-            self._lock = threading.Lock()
-            self._server = server_
-    
-        def newRequest(self, request_, jobName_, service_):
-            self._lock.acquire()
-            self._requests[request_] = (jobName_, service_)
-            self._lock.release()
-    
-        def checkoff(self, request_):
-            jobName = 'unknown'
-            service = 'unknown'
-            self._lock.acquire()
-
-            try:
-                jobName, service = self._requests.pop(request_)
-            except KeyError:
-                pass
-            except:
-                self._server.log('Error checking off request:', sys.exc_info()[0:2])
-
-            self._lock.release()
-
-            self._server.log('Checked off request of', service.name, 'from', jobName)
-    
-        def getReqInfo(self, request_):
-            self._lock.acquire()
-            try:
-                return self._requests[request_]
-            except:
-                return ('UNKNOWN', DAServer())
-            finally:
-                self._lock.release()
-
-
     def __init__(self, key_):
-
         if DEBUG: print 'Initializing ThreadingTCPServer'
-        SocketServer.ThreadingTCPServer.__init__(self, ('', PORT), DelegatingRequestHandler)
+        SocketServer.ThreadingTCPServer.__init__(self, ('', PORT), None)
 
         self._key = key_
-        self._log = None
+        self._logLines = Queue.Queue()
+        self._log = sys.stdout
         self._services = {}
+        self._running = False
 
-        self.requestManager = DelegatingTCPServer.RequestManager(self)
+        threading.Thread(target = self._writeLog, name = 'serverLog').start()
 
     def __del__(self):
         self.stop()
 
     def setLog(self, logFileName_):
-        self._log = (open(logFileName_, 'a', 0), threading.Lock())
+        self._log = open(logFileName_, 'a', 0)
 
     def verify_request(self, request_, clientAddress_):
         request_.settimeout(180)
         try:
-            self.log('Request received from', clientAddress_)
+            self.log('Request received from' + str(clientAddress_))
 
             key = request_.recv(1024)
             if key != self._key:
                 raise RuntimeError("Wrong key")
 
-            if DEBUG: self.log('Key verified for', clientAddress_)
+            if DEBUG: self.log('Key verified for ' + str(clientAddress_))
         except:
-            self.log('Handshake exception', sys.exc_info()[0:2])
+            self.log('Handshake exception ' + str(sys.exc_info()[0:2]))
             try:
                 request_.send('REJECT')
             except:
@@ -143,25 +89,35 @@ class DelegatingTCPServer(SocketServer.ThreadingTCPServer):
         return True
 
     def process_request_thread(self, request_, clientAddr_):
+        jobName = 'unknown'
+        serviceName = 'unknown'
         try:
             request_.send('JOB')
             jobName = request_.recv(1024)
             request_.send('SVC')
             serviceName = request_.recv(1024)
             
-            self.log('Job:', jobName, 'Service:', serviceName)
+            self.log('Job: ' + jobName + ' Service: ' + serviceName)
             
             service = self._services[serviceName]
-            self.requestManager.newRequest(request_, jobName, service)
             
             vcode = service.canServe(jobName)
             if vcode == 1:
                 request_.send('ACCEPT')
 
-                if DEBUG: self.log('Handshake complete with', clientAddr_)
+                if DEBUG: self.log('Handshake complete with ' + str(clientAddr_))
 
-                # now delegate the actual task to services (RequestHandlerClass is instantiated here)
-                self.finish_request(request_, clientAddr_)
+                # now delegate the actual task to service
+                try:
+                    if DEBUG: self.server.log('Passing ' + jobName + ' to ' + serviceName)
+                    service.serve(request_, jobName)
+                except:
+                    if DEBUG: self.server.log('Service exception ' + str(sys.exc_info()[0:2]))
+                    try:
+                        request_.send('REJECT')
+                    except:
+                        pass
+
             elif vcode == 0:
                 request_.send('WAIT')
             else:
@@ -170,45 +126,49 @@ class DelegatingTCPServer(SocketServer.ThreadingTCPServer):
             # let the client close the connection first; frees up server from having to stay in TIME_WAIT
             request_.recv(1024)
         except:
-            self.log('Process request exception', sys.exc_info()[0:2])
+            self.log('Process request exception ' + str(sys.exc_info()[0:2]))
             try:
                 request_.send('REJECT')
             except:
                 pass
 
         self.close_request(request_)
-        self.requestManager.checkoff(request_)
+        self.log('Closed request from ' + jobName + ' for ' + serviceName)
 
     def start(self):
         thread = threading.Thread(target = self.serve_forever, name = 'tcpServer')
+        thread.daemon = True
         thread.start()
+        self._running = True
 
         if DEBUG: print 'started TCP server'
 
     def stop(self):
+        self.log('Stopping server..')
+        if self._running: self.shutdown()
         self.server_close()
-        while len(self.requestManager._requests):
-            time.sleep(1)
-        self.shutdown()
+        self.log('Server stopped.')
+        self._running = False
+        self._logLines.put('EOF')
 
     def addService(self, service_):
-        service_.setLog(self._log)
+        service_.setLog(self.log)
         self._services[service_.name] = service_
 
-    def log(self, *args):
-        if not self._log: return
+    def log(self, linestr_, name = ''):
+        line = time.strftime('%H:%M:%S')
+        if name:
+            line += ' [' + name + ']'
+        line += ': ' + linestr_
+        self._logLines.put(line)
 
-        self._log[1].acquire()
-        try:
-            self._log[0].write(time.strftime('%H:%M:%S') + ': ')
-            for arg in args:
-                self._log[0].write(str(arg) + ' ')
-            self._log[0].write('\n')
-            self._log[0].flush()
-            os.fsync(self._log[0])
-        except:
-            pass
-        self._log[1].release()
+    def _writeLog(self):
+        while True:
+            line = self._logLines.get()
+            if line == 'EOF': break
+            self._log.write(line + '\n')
+            self._log.flush()
+            os.fsync(self._log)
 
 
 class DAServer(object):
@@ -218,38 +178,16 @@ class DAServer(object):
 
     def __init__(self, name_):
         self.name = name_
-        
-        self._log = None
-        pass
+        self.log = lambda *args : sys.stdout.write(self.name + ': ' + string.join(map(str, args)) + '\n')
 
-    def setLog(self, log_):
-        self._log = log_
+    def setLog(self, logFunc_):
+        self.log = lambda *args : logFunc_(string.join(map(str, args)), name = self.name)
 
     def canServe(self, jobName_):
         return -1
 
     def serve(self, request_, jobName_):
         pass
-
-    def log(self, *args):
-        if self._log:
-            self._log[1].acquire()
-            out = self._log[0]
-        else:
-            out = sys.stdout
-
-        try:
-            out.write(time.strftime('%H:%M:%S') + ' [' + self.name + ']: ')
-            for arg in args:
-                out.write(str(arg) + ' ')
-            out.write('\n')
-            out.flush()
-            os.fsync(out)
-        except:
-            pass
-
-        if self._log:
-            self._log[1].release()
 
 
 class DADispatcher(DAServer):
@@ -275,110 +213,142 @@ class DADispatcher(DAServer):
         Struct for job information.
         """
         
-        def __init__(self):
+        def __init__(self, name_):
+            self.name = name_
             self.id = ''
             self.node = ''
             self.state = 'CREATED'
             self.proc = None
 
                 
-    def __init__(self, workspace_, processors_, terminal_ = None):
+    def __init__(self, workspace_, dispatchMode_, resubmit = False, terminal = None):
         DAServer.__init__(self, 'dispatch')
         
         self._workspace = workspace_
-        self._processors = processors_
-        self._jobNames = [] # List of job names. Read-only usage once all jobs are created.
+        self._dispatchMode = dispatchMode_
         self._jobInfo = {}
+        self._resubmit = resubmit
+        self._readyJobs = []
+        self._runningJobs = []
         self._lock = threading.Lock()
-        if terminal_:
-            self._terminal = terminal_
+        self._update = threading.Event()
+        if terminal:
+            self._terminal = terminal
         else:
             self._terminal = Terminal(TERMNODE)
 
     def __del__(self):
-        if self._processors == 'bsub':
+        if self._dispatchMode == 'bsub':
             for jobInfo in self._jobInfo.values():
                 if jobInfo.state == 'RUNNING' or jobInfo.state == 'PENDING':
                     self._terminal.write('bkill {0}'.format(jobInfo.id))
 
-        elif self._processors == 'lxplus':
+        elif self._dispatchMode == 'lxplus':
             for jobInfo in self._jobInfo.values():
                 if jobInfo.proc.isOpen():
                     jobInfo.proc.close(force = True)
 
-        elif self._processors == 'local':
+        elif self._dispatchMode == 'local':
             for jobInfo in self._jobInfo.values():
                 if jobInfo.proc.poll() is None:
                     jobInfo.proc.terminate()
 
     def canServe(self, jobName_):
-        if jobName_ in self._jobNames: return 1
+        if jobName_ in self._jobInfo: return 1
         else: return -1
 
     def serve(self, request_, jobName_):
-        if jobName_ not in self._jobNames: return
+        if jobName_ not in self._jobInfo: return
 
         try:
             state = request_.recv(1024)
             self.log('Set state', jobName_, state)
         except:
-            self._lock.acquire()
-            self._jobInfo[jobName_].state = 'UNKNOWN'
-            self._lock.release()
-            return
+            state = 'UNKNOWN'
 
-        self._lock.acquire()
-        self._jobInfo[jobName_].state = state
-        self._lock.release()
+        with self._lock:
+            try:
+                jobInfo = self._jobInfo[jobName_]
+        
+                jobInfo.state = state
+    
+                if state == 'DONE':
+                    self._runningJobs.remove(jobInfo)
+                elif state == 'FAILED':
+                    self._runningJobs.remove(jobInfo)
+                    if self._resubmit:
+                        self._readyJobs.append(jobInfo)
+            except:
+                self.log('Exception while serving', jobName_, sys.exc_info()[0:2])
 
         if state == 'FAILED':
             with open(self._workspace + '/logs/' + jobName_ + '.fail', 'w') as failLog:
                 pass
+
+        self._update.set()
         
     def createJob(self, jobName_):
-        self._jobNames.append(jobName_)
-        self._jobInfo[jobName_] = DADispatcher.JobInfo()
+        self._jobInfo[jobName_] = DADispatcher.JobInfo(jobName_)
+        self._readyJobs.append(self._jobInfo[jobName_])
 
-    def submitJob(self, jobName_, bsubOptions_ = '', setenv_ = ''):
-        if jobName_ not in self._jobNames: return False
+    def submitOne(self, bsubOptions = '', setenv = '', logdir = ''):
+        if len(self._readyJobs):
+            jobInfo = self._readyJobs[0]
+            self.submit(jobInfo, bsubOptions, setenv, logdir)
 
-        self.log('Submitting job ', jobName_)
+    def submit(self, jobInfo_, bsubOptions = '', setenv = '', logdir = ''):
+        with self._lock:
+            try:
+                self._readyJobs.remove(jobInfo_)
+            except ValueError:
+                return
+                
+            self._runningJobs.append(jobInfo_)
+        
+        self.log('Submitting job ', jobInfo_.name)
 
-        if self._processors == 'bsub':
+        if not logdir:
+            logdir = self._workspace + '/logs'
+
+        if self._dispatchMode == 'bsub':
             command = "bsub {options} -J {jobName} -o {log} '{setenv}darun.py {workspace} {jobName}'".format(
-                options = bsubOptions_,
-                jobName = jobName_,
-                log = self._workspace + '/logs/' + jobName_ + '.log',
-                setenv = setenv_,
+                options = bsubOptions,
+                jobName = jobInfo_.name,
+                log = logdir + '/' + jobInfo_.name + '.log',
+                setenv = setenv,
                 workspace = self._workspace
             )
 
             self.log(command)
     
             bsubout = self._terminal.communicate(command)
-                    
-            if len(bsubout) == 0 or 'submitted' not in bsubout[0]:
-                self.log('bsub failed')
-                return False
-                        
-            matches = re.search('<([0-9]+)>', bsubout[0])
-            if not matches:
-                self.log('bsub returned', bsubout[0])
-                return False
-                        
-            self.log('lxbatch job ID for {0} is {1}'.format(jobName_, matches.group(1)))
-    
-            self._lock.acquire()
-            self._jobInfo[jobName_].id = matches.group(1)
-            self._jobInfo[jobName_].state = 'PENDING'
-            self._lock.release()
 
-        elif self._processors == 'lxplus':
+            success = False
+            if len(bsubout) != 0 and 'submitted' in bsubout[0]:
+                matches = re.search('<([0-9]+)>', bsubout[0])
+                if matches:
+                    success = True
+
+            if not success:
+                self.log('bsub failed')
+                with self._lock:
+                    self._runningJobs.remove(jobInfo_)
+                    self._readyJobs.append(jobInfo_)
+
+                return
+
+            self.log('lxbatch job ID for {0} is {1}'.format(jobInfo_.name, matches.group(1)))
+
+            jobId = matches.group(1)
+            node = ''
+            proc = None
+
+        elif self._dispatchMode == 'lxplus':
             command = '{setenv}darun.py {workspace} {jobName} > {log} 2>&1;exit'.format(
-                setenv = setenv_,
+                setenv = setenv,
                 workspace = self._workspace,
-                jobName = jobName_,
-                log = self._workspace + '/logs/' + jobName_ + '.log'
+                jobName = jobInfo_.name,
+                log = logdir + '/' + jobInfo_.name + '.log'
             )
 
             self.log(command)
@@ -388,18 +358,15 @@ class DADispatcher(DAServer):
 
             self.log('Command issued to', term.node)
 
-            self._lock.acquire()
-            self._jobInfo[jobName_].id = jobName_
-            self._jobInfo[jobName_].node = term.node
-            self._jobInfo[jobName_].state = 'PENDING'
-            self._jobInfo[jobName_].proc = term
-            self._lock.release()
+            jobId = jobInfo_.name
+            node = term.node
+            proc = term
 
-        elif self._processors == 'local':
+        elif self._dispatchMode == 'local':
             command = '{setenv}darun.py {workspace} {jobName}'.format(
-                setenv = setenv_,
+                setenv = setenv,
                 workspace = self._workspace,
-                jobName = jobName_
+                jobName = jobInfo_.name
             )
 
             self.log(command)
@@ -407,49 +374,57 @@ class DADispatcher(DAServer):
             proc = subprocess.Popen(command,
                                     shell = True,
                                     stdin = PIPE,
-                                    stdout = open(self._workspace + '/logs/' + jobName_ + '.log', 'w'),
+                                    stdout = open(logdir + '/' + jobInfo_.name + '.log', 'w'),
                                     stderr = subprocess.STDOUT
                                 )
 
             self.log('Subprocess started')
 
-            self._lock.acquire()
-            self._jobInfo[jobName_].id = jobName_
-            self._jobInfo[jobName_].node = 'localhost'
-            self._jobInfo[jobName_].state = 'PENDING'
-            self._jobInfo[jobName_].proc = proc
-            self._lock.release()
+            jobId = jobInfo_.name
+            node = 'localhost'
 
-        else:
-            return False
+        with self._lock:
+            jobInfo_.id = jobId
+            jobInfo_.state = 'PENDING'
+            jobInfo_.proc = proc
+            jobInfo_.node = node
 
-        return True
+    def dispatch(self, subMax_, bsubOptions = '', setenv = '', logdir = ''):
+        lastUpdateTime = time.time()
+        
+        while True:
+            with self._lock:
+                nReady = len(self._readyJobs)
+                nRunning = len(self._runningJobs)
+            
+            if nReady != 0 and nRunning < subMax_:
+                self.submitOne(bsubOptions, setenv, logdir)
+                continue
 
-    def countJobs(self):
-        jobCounts = dict((key, 0) for key in DADispatcher.states)
+            if nReady == 0 and nRunning == 0:
+                break
+                
+            self._update.wait(20.)
+            self._update.clear()
 
-        self._lock.acquire()
-        for jobInfo in self._jobInfo.values():
-            jobCounts[jobInfo.state] += 1
-        self._lock.release()
+            self.printStatus()                
 
-        return jobCounts
-
-    def getJobs(self, states_):
-        if type(states_) is not tuple:
-            states_ = (states_,)
-
-        self._lock.acquire()
-        jobNames = [jobName for jobName, jobInfo in self._jobInfo.items() if jobInfo.state in states_]
-        self._lock.release()
-
-        return jobNames
+            if time.time() - lastUpdateTime > 20.:
+                self.queryJobStates()
+                self.printStatusWeb()
+                lastUpdateTime = time.time()
 
     def queryJobStates(self):
-        self._lock.acquire()
 
+        exited = []
+        def setExited(jobInfo):
+            jobInfo.state = 'EXITED'
+            self._runningJobs.remove(jobInfo)
+            if self._resubmit: self._readyJobs.append(jobInfo)
+            exited.append(jobInfo)
+        
         try:
-            if self._processors == 'bsub':
+            if self._dispatchMode == 'bsub':
                 lsfTracked = []
                 lsfNodes = []
     
@@ -463,35 +438,42 @@ class DADispatcher(DAServer):
 
                 # Two different tasks - if id is in the list of ids, set the node name
                 # if not, the job may have exited abnormally - check state.
-                for jobName, jobInfo in self._jobInfo.items():
-                    if jobInfo.id in lsfTracked:
-                        idx = lsfTracked.index(jobInfo.id)
-                        jobInfo.node = lsfNodes[idx]
-                    elif jobInfo.state == 'PENDING' or jobInfo.state == 'RUNNING':
-                        self.log('Set state', jobName, 'EXITED')
-                        jobInfo.state = 'EXITED'
-                        with open(self._workspace + '/logs/' + jobName + '.fail', 'w') as failLog:
-                            pass
+                with self._lock:
+                    for jobInfo in self._jobInfo.values():
+                        if jobInfo.id in lsfTracked:
+                            idx = lsfTracked.index(jobInfo.id)
+                            jobInfo.node = lsfNodes[idx]
+                        elif jobInfo in self._runningJobs:
+                            setExited(jobInfo)
 
-            elif self._processors == 'lxplus':
-                for jobName, jobInfo in self._jobInfo.items():
-                    if jobInfo.state == 'RUNNING' and not jobInfo.proc.isOpen():
-                        self.log('Set state', jobName, 'EXITED')
-                        jobInfo.state = 'EXITED'
-                        with open(self._workspace + '/logs/' + jobName + '.fail', 'w') as failLog:
-                            pass
+            elif self._dispatchMode == 'lxplus':
+                with self._lock:
+                    for jobInfo in filter(lambda jobInfo : not jobInfo.proc.isOpen(), self._jobInfo.values()):
+                        if jobInfo in self._runningJobs:
+                            setExited(jobInfo)
     
-            elif self._processors == 'local':
-                for jobName, jobInfo in self._jobInfo.items():
-                    if jobInfo.state == 'RUNNING' and jobInfo.proc.poll() is not None:
-                        self.log('Set state', jobName, 'EXITED')
-                        jobInfo.state = 'EXITED'
-                        with open(self._workspace + '/logs/' + jobName + '.fail', 'w') as failLog:
-                            pass
+            elif self._dispatchMode == 'local':
+                with self._lock:
+                    for jobInfo in filter(lambda jobInfo : jobInfo.proc.poll() is not None, self._jobInfo.values()):
+                        if jobInfo in self._runningJobs:
+                            setExited(jobInfo)
+
         except:
             self.log('Job status query failed')
-            
-        self._lock.release()
+
+        for jobInfo in exited:
+            self.log('Set state', jobInfo.name, 'EXITED')
+            with open(self._workspace + '/logs/' + jobInfo.name + '.fail', 'w') as failLog:
+                pass
+
+    def countJobs(self):
+        jobCounts = dict((key, 0) for key in DADispatcher.states)
+
+        with self._lock:
+            for jobInfo in self._jobInfo.values():
+                jobCounts[jobInfo.state] += 1
+
+        return jobCounts
 
     def printStatus(self, asstr = False):
         jobCounts = self.countJobs()
@@ -509,17 +491,25 @@ class DADispatcher(DAServer):
             if DEBUG: sys.stdout.write('\n')
             sys.stdout.flush()
 
-    def printStatusWeb(self):
-        for fileName in os.listdir(self._workspace + '/logs'):
-            with open(self._workspace + '/logs/' + fileName, 'r') as source:
-                with open(HTMLDIR + '/logs/' + fileName, 'w') as dest:
-                    for line in source:
-                        dest.write(line)
+    def printStatusWeb(self, copyLogs = False):
+        if copyLogs:
+            for fileName in os.listdir(self._workspace + '/logs'):
+                sourceName = self._workspace + '/logs/' + fileName
+                destName = HTMLDIR + '/logs/' + fileName
+                if not os.path.exists(destName) or os.stat(sourceName).st_mtime > os.stat(destName).st_mtime:
+                    with open(sourceName, 'r') as source:
+                        with open(destName, 'w') as dest:
+                            for line in source:
+                                dest.write(line)
 
         statusStr = self.printStatus(asstr = True)
 
-        self._lock.acquire()
-
+        allJobs = self._jobInfo.keys()
+        try:
+            allJobs.sort(lambda x, y : int(x) - int(y))
+        except ValueError:
+            allJobs.sort()
+       
         with open(HTMLDIR + '/index.html', 'w') as htmlFile:
             htmlFile.write('''
 <html>
@@ -545,28 +535,27 @@ table
 <tr><th>Name</th><th>ID</th><th>Node</th><th>State</th></tr>
 ''')
 
-            for jobName in self._jobNames:
-                jobInfo = self._jobInfo[jobName]
-                htmlFile.write('<tr><td><a href="logs/{name}.log">{name}</a></td><td>{jobId}</td><td>{node}</td><td>{state}</td></tr>\n'.format(name = jobName, jobId = jobInfo.id, node = jobInfo.node, state = jobInfo.state))
+            with self._lock:
+                for jobName in allJobs:
+                    jobInfo = self._jobInfo[jobName]
+                    htmlFile.write('<tr><td><a href="logs/{name}.log">{name}</a></td><td>{jobId}</td><td>{node}</td><td>{state}</td></tr>\n'.format(name = jobInfo.name, jobId = jobInfo.id, node = jobInfo.node, state = jobInfo.state))
 
             htmlFile.write('''
 </table>
 </body>
 </html>
 ''')
-
-        self._lock.release()
         
                 
 class DownloadRequestServer(DAServer):
     """
-    Service for download traffic control.
+    Service for download traffic control. Serializes multiple requests to a single resource (disk).
     Protocol:
       SRV: send READY
       CLT: trasfer, send OK or FAIL (no action on server side in either case)
     """
 
-    MAXDEPTH = 3
+    MAXDEPTH = 4
 
     def __init__(self, name_):
         DAServer.__init__(self, name_)
@@ -582,18 +571,16 @@ class DownloadRequestServer(DAServer):
         self._queue.put(request_)
         if DEBUG: self.log('Queued job', jobName_)
 
-        self._lock.acquire()
-        while True:
-            try:
-                request = self._queue.get(block = False) # will raise Queue.Empty exception when empty
-                while True:
-                    response = request.recv(1024)
-                    if response == 'DONE': break
-                    request.send('GO')
-            except:
-                break
-
-        self._lock.release()
+        with self._lock:
+            while True:
+                try:
+                    request = self._queue.get(block = False) # will raise Queue.Empty exception when empty
+                    while True:
+                        response = request.recv(1024)
+                        if response == 'DONE': break
+                        request.send('GO')
+                except:
+                    break
 
 
 class Reducer(DAServer):
@@ -611,19 +598,13 @@ class Reducer(DAServer):
         self._targetFileSuffix = targetFileName_[targetFileName_.rfind('.'):]
         self._maxSize = maxSize_
         
-        self._lock = threading.Lock()
         self._outputNumber = 0
 
         self.inputQueue = Queue.Queue()
 
         self.workdir = workdir_
 
-        if self.workdir:
-            try:
-                os.mkdir(self.workdir + '/' + self.name)
-            except OSError:
-                pass
-        else:
+        if not self.workdir:
             while True:
                 self.workdir = TMPDIR + '/' + string.join(random.sample(string.ascii_lowercase, 6), '')
                 try:
@@ -634,7 +615,8 @@ class Reducer(DAServer):
         try:
             os.mkdir(self.workdir + '/input')
         except OSError:
-            pass
+            if not os.path.isdir(self.workdir + '/input'):
+                raise RuntimeError("Reducer input directory")
         
         if DEBUG: self.log('Working directory', self.workdir)
         
@@ -728,81 +710,79 @@ class Hadder(Reducer):
             argv = sys.argv
             sys.argv = ['', '-b']
             import ROOT
-            sys.argv = argv
+            Hadder.ROOT.gSystem.Load("libTreePlayer.so")
             Hadder.ROOT = ROOT
+            sys.argv = argv # sys.argv is read when a first call to ROOT object is made
         
         Reducer.__init__(self, name_, targetFileName_, maxSize_, workdir_)
 
-        Hadder.ROOT.gSystem.Load("libTreePlayer.so")
+        self._lock = threading.Lock()
 
     def reduce(self):
-        self._lock.acquire()
-
-        inputPaths = []
-        while True:
-            try:
-                inputFile = self.inputQueue.get(block = False) # will raise Queue.Empty exception when empty
-                inputPaths.append(self.workdir + '/input/' + inputFile)
-            except Queue.Empty:
-                break
-
-        tmpOutputPath = self.workdir + '/tmp' + self._targetFileSuffix
-
-        while len(inputPaths):
-            merger = Hadder.ROOT.TFileMerger(False, False)
+        with self._lock:
+            inputPaths = []
+            while True:
+                try:
+                    inputFile = self.inputQueue.get(block = False) # will raise Queue.Empty exception when empty
+                    inputPaths.append(self.workdir + '/input/' + inputFile)
+                except Queue.Empty:
+                    break
     
-            if not merger.OutputFile(tmpOutputPath):
-                self.log('Cannot open temporary output', tmpOutputPath)
-                self.failed += inputPaths
-                return
+            tmpOutputPath = self.workdir + '/tmp' + self._targetFileSuffix
     
-            outputPath = self.workdir + '/' + self._targetFileBase + '_' + str(self._outputNumber) + self._targetFileSuffix
+            while len(inputPaths):
+                merger = Hadder.ROOT.TFileMerger(False, False)
+        
+                if not merger.OutputFile(tmpOutputPath):
+                    self.log('Cannot open temporary output', tmpOutputPath)
+                    self.failed += inputPaths
+                    return
+        
+                outputPath = self.workdir + '/' + self._targetFileBase + '_' + str(self._outputNumber) + self._targetFileSuffix
+        
+                if os.path.exists(outputPath):
+                    inputPaths.insert(0, outputPath)
+        
+                self.log('Merging', inputPaths)
+        
+                totalSize = 0
+                toAdd = []
+                for inputPath in inputPaths:
+                    if DEBUG: print 'Reduce:', inputPath
+        
+                    if not merger.AddFile(inputPath):
+                        self.log('Cannot add', inputPath, 'to list')
+                        self.failed.append(inputPath)
+                        continue
+        
+                    totalSize += os.stat(inputPath).st_size
+                    toAdd.append(inputPath)
+        
+                    if totalSize / 1048576 >= self._maxSize: break
+                else:
+                    # loop over inputPaths reached the end -> no need to increment outputNumber
+                    self._outputNumber -= 1
     
-            if os.path.exists(outputPath):
-                inputPaths.insert(0, outputPath)
+                inputPaths = inputPaths[inputPaths.index(inputPath) + 1:]
     
-            self.log('Merging', inputPaths)
+                self.log('hadd', tmpOutputPath, string.join(toAdd))
+                result = merger.Merge()
     
-            totalSize = 0
-            toAdd = []
-            for inputPath in inputPaths:
-                if DEBUG: print 'Reduce:', inputPath
+                if '/input/' not in toAdd[0]: # first element was the previous output
+                    toAdd.pop(0)
+                
+                if result:
+                    self.log('mv', tmpOutputPath, outputPath)
+                    os.rename(tmpOutputPath, outputPath)
+                    self.succeeded += toAdd
+                else:
+                    self.log('Merge failed')
+                    self.failed += toAdd
     
-                if not merger.AddFile(inputPath):
-                    self.log('Cannot add', inputPath, 'to list')
-                    self.failed.append(inputPath)
-                    continue
+                self._outputNumber += 1
     
-                totalSize += os.stat(inputPath).st_size
-                toAdd.append(inputPath)
-    
-                if totalSize / 1048576 >= self._maxSize: break
-            else:
-                # loop over inputPaths reached the end -> no need to increment outputNumber
-                self._outputNumber -= 1
-
-            inputPaths = inputPaths[inputPaths.index(inputPath) + 1:]
-
-            self.log('hadd', tmpOutputPath, string.join(toAdd))
-            result = merger.Merge()
-
-            if '/input/' not in toAdd[0]: # first element was the previous output
-                toAdd.pop(0)
-            
-            if result:
-                self.log('mv', tmpOutputPath, outputPath)
-                os.rename(tmpOutputPath, outputPath)
-                self.succeeded += toAdd
-            else:
-                self.log('Merge failed')
-                self.failed += toAdd
-
-            self._outputNumber += 1
-
-            totalSize = 0
-            added = []
-    
-        self._lock.release()
+                totalSize = 0
+                added = []
 
             
 class Terminal:
@@ -817,7 +797,7 @@ class Terminal:
         self.open()
 
     def __del__(self):
-        self.close()
+        self.close(force = True)
 
     def open(self):
         if self.isOpen(): return
@@ -826,21 +806,31 @@ class Terminal:
             stdin = subprocess.PIPE,
             stdout = subprocess.PIPE,
             stderr = subprocess.STDOUT,
-            preexec_fn = ignoreSIGINT)
+	    preexec_fn = lambda : signal.signal(signal.SIGINT, signal.SIG_IGN))
         
         self.node = self.communicate('echo $HOSTNAME')[0]
         print 'Terminal opened on ' + self.node
         
-    def close(self, force_ = False):
+    def close(self, force = False):
         if not self.isOpen(): return
         
         try:
-            if force_: self._session.terminate()
+            if force: self._session.terminate()
             else: self._session.stdin.write('exit\n')
-            while self._session.poll() is None: pass
+
+            iTry = 0
+            while iTry < 5 and self._session.poll() is None:
+                time.sleep(1)
+                iTry += 1
+
+            if self._session.poll() is None:
+                self._session.terminate()
+                
             self.node = ''
+        except OSError:
+            pass
         except:
-            print 'Failed to close SSH connection'
+            print 'Failed to close SSH connection:', sys.exc_info()[0:2]
 
     def isOpen(self):
         return self._session and self._session.poll() is None
@@ -889,7 +879,6 @@ class Terminal:
 
 
 if __name__ == '__main__':
-
     try:
         if DCMUHOST not in os.environ['HOSTNAME']:
             raise EnvironmentError
@@ -924,24 +913,23 @@ if __name__ == '__main__':
     parser.add_option_group(execOpts)
 
     inputOpts = OptionGroup(parser, "Input options", "These options are used at job creation time to configure the input.")
-    inputOpts.add_option("-n", "--files-per-job", type="int", dest='filesPerJob', help='Number of files per job', metavar="NUM", default=8)
-    #    inputOpts.add_option("-x", "--external-list", dest='externalList', help="External list of strings to be used for job scheduling")
+    inputOpts.add_option("-n", "--files-per-job", type="int", dest='filesPerJob', help='Number of files per job.', metavar="NUM", default=8)
     inputOpts.add_option("-f", "--file-format", dest="nameFormat",
         help="""\
-Wildcard expression of the name of the files in the dataset to use. Multiple files (separated by comma) can be related through the wildcard character.
-Each instance of the match is passed to the worker function. Example: susyEvents*.root,susyTriggers*.root""",
+        Wildcard expression of the name of the files in the dataset to use. Multiple files (separated by comma) can be related through the wildcard character.
+        Each instance of the match is passed to the worker function. Example: susyEvents*.root,susyTriggers*.root""",
         default="*.root", metavar="FORMAT")
-    #    inputOpts.add_option("-z", "--no-suffix", action="store_true", dest="noSuffix", help="Do not append the jobId to the output file names")
     parser.add_option_group(inputOpts)
 
     runtimeOpts = OptionGroup(parser, "Runtime options", "These options can be changed for each job submission.")
     runtimeOpts.add_option('-c', '--client', dest='client', help="Client to use for processing. Options are bsub (lxbatch), lxplus, and local.", default='bsub', metavar="MODE")
-    runtimeOpts.add_option("-b", "--bsub-options", dest="bsubOptions", help='Options to pass to bsub command. -J and -cwd are set automatically. Example: -R "rusage[pool=2048]" -q 1nh', metavar="OPTIONS", default="-q 1nh")
+    runtimeOpts.add_option("-b", "--bsub-options", dest="bsubOptions", help='Options to pass to bsub command. -J and -cwd are set automatically. Example: -R "rusage[pool=2048]" -q 8nh', metavar="OPTIONS", default="-q 8nh")
     runtimeOpts.add_option("-D", "--debug", action="store_true", dest="debug", help="")
     runtimeOpts.add_option("-r", "--resubmit", action="store_true", dest="resubmit", help="Resubmit the job")
     runtimeOpts.add_option("-R", "--recover", action="store_true", dest="recover", help="Recover failed jobs")
-    runtimeOpts.add_option("-M", "--max-jobs", dest="maxJobs", help="Maximum (approximate) number of concurrent jobs to be submitted", type="int", default=30, metavar="NUM")
-    runtimeOpts.add_option("-j", "--jobs", dest="jobs", help="Jobs to submit", default="", metavar="JOB1[,JOB2[,JOB3...]]")
+    runtimeOpts.add_option("-P", "--max-parallel", dest="maxParallel", help="Maximum (approximate) number of parallel jobs to run.", type="int", default=25, metavar="NUM")
+    runtimeOpts.add_option("-j", "--jobs", dest="jobs", help="Jobs to submit.", default="", metavar="JOB1[,JOB2[,JOB3...]]")
+    runtimeOpts.add_option("-M", "--max-jobs", dest="maxJobs", help="Maximum number of jobs to submit.", type="int", default=-1, metavar="NUM")
     runtimeOpts.add_option("-S", "--auto-resubmit", action="store_true", dest="autoResubmit", help="Automatically resubmit failed jobs")
     runtimeOpts.add_option("-t", "--no-submit", action="store_true", dest="noSubmit", help="Compile and quit")
     parser.add_option_group(runtimeOpts)
@@ -960,14 +948,6 @@ Each instance of the match is passed to the worker function. Example: susyEvents
     if not resubmit and (len(args) < 2 or not options.workspace):
         parser.print_usage()
         sys.exit(1)
-
-    ### OPEN TERMINAL ###
-
-    terminal = Terminal(TERMNODE)
-
-    setenv = options.setenv.strip().rstrip(';')
-    if setenv:
-        setenv += '; '
 
     ### CREATE SERVER ###
 
@@ -1034,7 +1014,10 @@ Each instance of the match is passed to the worker function. Example: susyEvents
         jobConfig["outputFile"] = options.outputFile.strip()
         jobConfig["reducer"] = options.reducer.strip()
         jobConfig["maxSize"] = options.maxSize
-        jobConfig["setenv"] = setenv
+
+        jobConfig["setenv"] = options.setenv.strip().rstrip(';')
+        if jobConfig['setenv']:
+            jobConfig['setenv'] += '; '
 
     print 'Using {0} as workspace'.format(workspace)
 
@@ -1060,7 +1043,7 @@ Each instance of the match is passed to the worker function. Example: susyEvents
 
     ### SERVER LOG ###
 
-    tcpServer.setLog(workspace + '/logs/server.log')
+    tcpServer.setLog(HTMLDIR + '/logs/server.log')
 
     ### JOB LIST ###
     
@@ -1125,10 +1108,9 @@ Each instance of the match is passed to the worker function. Example: susyEvents
         print 'no matching jobs found. exiting.'
         sys.exit(0)
 
-    try:
-        allJobs.sort(lambda x, y : int(x) - int(y))
-    except ValueError:
-        allJobs.sort()
+    ### OPEN TERMINAL ###
+
+    terminal = Terminal(TERMNODE)
 
     ### MACRO ###
 
@@ -1195,13 +1177,18 @@ Each instance of the match is passed to the worker function. Example: susyEvents
         if not jobConfig['outputFile']:
             raise RuntimeError('Reducer requires output file name specification')
 
-        reducer = eval(jobConfig['reducer'])('reduce', jobConfig['outputFile'], jobConfig['maxSize'], tmpWorkspace)
-        reducer.setLog(tcpServer._log)
+        try:
+            os.mkdir(tmpWorkspace + '/reduce')
+        except OSError:
+            pass
+
+        reducer = eval(jobConfig['reducer'])('reduce', jobConfig['outputFile'], jobConfig['maxSize'], tmpWorkspace + '/reduce')
+        reducer.setLog(tcpServer.log)
 #        tcpServer.addService(reducer)
 # Choosing to run reducer "offline" and not as a service; adds stability with a price of little time rag after the jobs are done. darun jobs will upload the output to $TMPDIR/{key}/reduce
 
     # dispatcher
-    dispatcher = DADispatcher(workspace, options.client, terminal)
+    dispatcher = DADispatcher(workspace, options.client, resubmit = options.autoResubmit, terminal = terminal)
 
     for jobName in allJobs:
         dispatcher.createJob(jobName)
@@ -1230,41 +1217,14 @@ Each instance of the match is passed to the worker function. Example: susyEvents
 
     print 'Start job submission'
 
-    while True:
-        dispatcher.printStatus()
-        dispatcher.printStatusWeb()
-        
-        jobCounts = dispatcher.countJobs()
-
-        if options.autoResubmit:
-            if jobCounts['DONE'] + jobCounts['UNKNOWN'] == len(allJobs): break
-        else:
-            if jobCounts['DONE'] + jobCounts['FAILED'] + jobCounts['EXITED'] + jobCounts['UNKNOWN'] == len(allJobs): break
-        
-        if options.autoResubmit:
-            mask = ('CREATED', 'FAILED', 'EXITED')
-        else:
-            mask = 'CREATED'
-
-        subLimit = options.maxJobs - jobCounts['PENDING'] - jobCounts['RUNNING']
-
-        if subLimit > 0:
-            for jobName in dispatcher.getJobs(mask)[0:subLimit]:
-                dispatcher.submitJob(jobName, options.bsubOptions, jobConfig['setenv'])
-
-        time.sleep(20)
-
-        dispatcher.queryJobStates()
-
-    # stop the TCP server
-    tcpServer.stop()
+    dispatcher.dispatch(options.maxParallel, bsubOptions = options.bsubOptions, setenv = jobConfig['setenv'], logdir = HTMLDIR + '/logs')
 
     dispatcher.printStatus()
     dispatcher.printStatusWeb()
 
     print ''
 
-    if jobCounts['DONE'] != len(allJobs):
+    if dispatcher.countJobs()['DONE'] != len(allJobs):
         print 'There are failed jobs.'
         sys.exit(1)
 
@@ -1288,8 +1248,18 @@ Each instance of the match is passed to the worker function. Example: susyEvents
                 reducer.cleanup()
         else:
             print 'Copy to ' + jobConfig['outputNode'] + ':' + jobConfig['outputDir'] + ' failed.'
+            sys.exit(1)
+
+    ### COPY LOG FILES ###
+
+    for logFile in os.listdir(HTMLDIR + '/logs'):
+        shutil.copy(HTMLDIR + '/logs/' + logFile, workspace + '/logs/' + logFile)
 
     ### CLEANUP ###
+
+    tcpServer.stop()
+    
+    terminal.close()
             
     shutil.rmtree(tmpWorkspace, ignore_errors = True)
 
