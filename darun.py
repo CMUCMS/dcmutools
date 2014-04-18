@@ -35,19 +35,17 @@ SCP = ['scp', '-oStrictHostKeyChecking=no', '-oLogLevel=quiet']
 logLock = threading.Lock()
 
 def log(*args):
-    logLock.acquire()
-    try:
-        message = ': '
-        for arg in args:
-            message += str(arg) + ' '
-
-        sys.stdout.write(time.strftime('%H:%M:%S') + message + '\n')
-        sys.stdout.flush()
-        if sys.stdout.fileno() != 1: os.fsync(sys.stdout) # stdout is redirected to a file
-    except:
-        pass
-    finally:
-        logLock.release()
+    with logLock:
+        try:
+            message = ': '
+            for arg in args:
+                message += str(arg) + ' '
+    
+            sys.stdout.write(time.strftime('%H:%M:%S') + message + '\n')
+            sys.stdout.flush()
+            if sys.stdout.fileno() != 1: os.fsync(sys.stdout) # stdout is redirected to a file
+        except:
+            pass
 
 class ServerConnection(object):
 
@@ -115,27 +113,29 @@ class ServerConnection(object):
             pass
     
     
-def downloadFiles(workspace_, jobName_, key_, host_, port_, queue_):
+def downloadFiles(workspace_, jobName_, key_, host_, queue_):
 
     inputList = []
     with open(workspace_ + '/inputs/' + jobName_) as inputListFile:
-        for line in inputListFile:
-            inputList.append(line)
-
+        for inputRow in inputListFile:
+            inputList.append(eval(inputRow)) # [(dev, path), ...]; one line corresponds to one set of input
+            
     while len(inputList):
         inputLine = inputList[0]
-        diskName = re.match('/data/(disk[0-9]+)/', inputLine).group(1)
-        conn = ServerConnection(diskName)
-        if conn.sock is None:
-            queue_.put('FAILED')
-            break
+        if DEBUG: log('input line:' + str(inputLine))
 
-        try:
-            remoteFiles = map(str.strip, inputLine.split(','))
-            localPaths = []
-            for remotePath in remoteFiles:
-                log('downloading file', remotePath)
+        localPaths = []
+        for diskName, remotePath in inputLine:
+            log('downloading file', remotePath)
+
+            localPath = TMPDIR + '/' + key_ + '/input/' + jobName_ + '/' + remotePath[remotePath.rfind('/') + 1:]
+
+            conn = ServerConnection(diskName)
+            if conn.sock is None:
+                queue_.put('FAILED')
+                break
     
+            try:
                 if DEBUG: log('DLD')
                 conn.sock.send('DLD')
                 response = conn.sock.recv(1024)
@@ -143,31 +143,27 @@ def downloadFiles(workspace_, jobName_, key_, host_, port_, queue_):
 
                 if response != 'GO':
                     raise RuntimeError('no permission')
-
-                localPath = TMPDIR + '/' + key_ + '/input/' + jobName_ + '/' + remotePath[remotePath.rfind('/') + 1:]
     
                 scpProc = subprocess.Popen(SCP + [host_ + ':' + remotePath, localPath])
                 while scpProc.poll() is None: time.sleep(2)
                 if scpProc.returncode != 0:
                     raise RuntimeError('copy failure')
+
+                if DEBUG: log('DONE')
+                conn.sock.send('DONE')
     
                 localPaths.append(localPath)
-            else:
-                # copied all files in this line
-                if DEBUG: log('DONE')
-                
-                conn.sock.send('DONE')
-                        
-                queue_.put(tuple(localPaths))
-                
-                log('successfully downloaded', localPaths)
 
-                inputList.pop(0)
-
-        except:
-            log('download request failed in', jobName_, 'due to', sys.exc_info()[0:2], '. retrying')
-            continue
-
+            except:
+                log('download request failed in', jobName_, 'due to', sys.exc_info()[0:2], '. retrying')
+                continue
+        else:
+            # copied all files in this line
+            log('successfully downloaded', localPaths)
+           
+            queue_.put(tuple(localPaths))
+            inputList.pop(0)
+            
     else:
         # successfully downloaded all files
         queue_.put('DONE')
@@ -180,19 +176,19 @@ if __name__ == '__main__':
     workspace = sys.argv[1]
     jobName = sys.argv[2]
 
-    logFile = open(workspace + '/logs/' + jobName + '.log', 'w', 0)
-    sys.stdout = logFile
-    sys.stderr = logFile
-
     sys.argv = ['', '-b']
 
     import ROOT
 
     sys.path.append(workspace)
+    from jobconfig import jobConfig
+
+    logFile = open(jobConfig['logDir'] + '/' + jobName + '.log', 'w', 0)
+    sys.stdout = logFile
+    sys.stderr = logFile
 
     log('loading config')
 
-    from jobconfig import jobConfig
     from macro import arguments # worker source code loaded to ROOT here
 
     ServerConnection.key = jobConfig['key']
@@ -230,9 +226,9 @@ if __name__ == '__main__':
     
     log('starting downloader')
     
-    thread = threading.Thread(target = downloadFiles, args = (workspace, jobName, jobConfig['key'], jobConfig['serverHost'], jobConfig['serverPort'], fileNameQueue))
-    thread.daemon = True
-    thread.start()
+    downloadThread = threading.Thread(target = downloadFiles, args = (workspace, jobName, jobConfig['key'], jobConfig['serverHost'], fileNameQueue))
+    downloadThread.daemon = True
+    downloadThread.start()
 
     try:
         # start looping over downloaded files
@@ -245,18 +241,22 @@ if __name__ == '__main__':
             block = True
             while True:
                 try:
-                    fileNames = fileNameQueue.get(block = block)
+                    fileNames = fileNameQueue.get(block = block, timeout = 180)
                     block = False # only block for the first time
 
                     if fileNames == 'FAILED':
                         raise RuntimeError('Download failed')
                     elif fileNames == 'DONE':
                         lastPass = True
+                        break
                     else:
                         analyzer.addInput(*fileNames)
                         downloaded.append(fileNames)
                 except Queue.Empty:
-                    break
+                    if not downloadThread.isAlive(): # Empty raised because of timeout
+                        raise RuntimeError('Downloader not responding')
+                    else:
+                        break
             
             log('received file names', downloaded)
 
