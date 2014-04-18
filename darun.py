@@ -253,10 +253,13 @@ if __name__ == '__main__':
                         analyzer.addInput(*fileNames)
                         downloaded.append(fileNames)
                 except Queue.Empty:
-                    if not downloadThread.isAlive(): # Empty raised because of timeout
+                    if downloadThread.isAlive():
+                        if block: # Empty raised because of timeout
+                            continue
+                        else: # Just checked if there are additional files
+                            break
+                    else: # Downloader crashed
                         raise RuntimeError('Downloader not responding')
-                    else:
-                        break
             
             log('received file names', downloaded)
 
