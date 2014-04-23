@@ -33,6 +33,8 @@ from reducer import *
 from terminal import Terminal
 from dscp import dscp
 
+SERVERONLY = False # for debugging purpose
+
 
 class DelegatingTCPServer(SocketServer.ThreadingTCPServer):
     """
@@ -584,8 +586,11 @@ class DSCPServer(QueuedServer):
 
             try:
                 success = dscp(fileName, self._targetDir + '/' + os.path.basename(fileName), self.log)
-                if not success:
+                if success:
+                    os.remove(fileName)
+                else:
                     self.log(fileName, 'was not copied to', self._targetDir)
+                    raise Exception
             except:
                 self.log('Error in copying', fileName)
                 raise RuntimeError('CopyError')

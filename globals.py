@@ -17,4 +17,3 @@ except KeyError:
     TMPDIR = '/tmp/' + USER
 
 DEBUG = False
-SERVERONLY = False # for debugging purpose

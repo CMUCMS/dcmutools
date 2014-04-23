@@ -24,6 +24,7 @@ import subprocess
 import time
 import shutil
 import threading
+import ftplib
 import Queue
 
 TMPDIR = os.environ['TMPDIR']
@@ -144,11 +145,28 @@ def downloadFiles(workspace_, jobName_, key_, host_, queue_):
 
                 if response != 'OK':
                     raise RuntimeError('no permission')
-    
-                scpProc = subprocess.Popen(SCP + [host_ + ':' + remotePath, localPath])
-                while scpProc.poll() is None: time.sleep(2)
-                if scpProc.returncode != 0:
-                    raise RuntimeError('copy failure')
+
+                try:
+                    # first try ftp
+                    ftp = ftplib.FTP('dcmu00', 'anonymous')
+                    response = ftp.cwd(os.path.dirname(remotePath))
+                    if int(response.split()[0]) != 250:
+                        raise Exception
+                    with open(localPath, 'wb') as remoteFile:
+                        response = ftp.retrbinary('RETR ' + os.path.basename(remotePath), remoteFile.write)
+                        if int(response.split()[0]) != 226:
+                            raise Exception
+                except:
+                    # try scp
+                    scpProc = subprocess.Popen(SCP + [host_ + ':' + remotePath, localPath])
+                    while scpProc.poll() is None: time.sleep(2)
+                    if scpProc.returncode != 0:
+                        raise RuntimeError('copy failure')
+                finally:
+                    try:
+                        ftp.quit()
+                    except:
+                        pass
 
                 if DEBUG: log('DONE')
                 conn.sock.send('DONE')
