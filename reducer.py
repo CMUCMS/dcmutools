@@ -1,17 +1,20 @@
 import os
 import sys
 import random
+import time
 import string
 import glob
+import shutil
 import Queue
 import threading
+import subprocess
 
 srcdir = os.path.dirname(os.path.realpath(__file__))
 if srcdir not in sys.path:
     sys.path.append(srcdir)
+from globals import *
 from daserver import DAServer
-
-DEBUG = False
+from dscp import dscp
 
 class Reducer(DAServer):
     """
@@ -21,18 +24,18 @@ class Reducer(DAServer):
       CLT: scp to target directory, send file name
     """
 
-    def __init__(self, name_, targetFileName_, maxSize_ = 0, workdir_ = ''):
+    def __init__(self, name_, targetFileName_, maxSize = 0, workdir = ''):
         DAServer.__init__(self, name_)
         
         self._targetFileBase = targetFileName_[0:targetFileName_.rfind('.')]
         self._targetFileSuffix = targetFileName_[targetFileName_.rfind('.'):]
-        self._maxSize = maxSize_
+        self._maxSize = maxSize
         
         self._outputNumber = 0
 
         self.inputQueue = Queue.Queue()
 
-        self.workdir = workdir_
+        self.workdir = workdir
 
         if not self.workdir:
             while True:
@@ -116,8 +119,13 @@ class Reducer(DAServer):
             
         else:
             try:
+                if destination_[0:7] == '/store/':
+                    copyFunc = dscp
+                else:
+                    os.rename
+                
                 for outputFile in glob.glob(self.workdir + '/' + self._targetFileBase + '*' + self._targetFileSuffix):
-                    os.rename(outputFile, destination_ + '/' + os.path.basename(outputFile))
+                    copyFunc(outputFile, destination_ + '/' + os.path.basename(outputFile))
 
                 return True
             except:
@@ -136,7 +144,7 @@ class Hadder(Reducer):
 
     ROOT = None
 
-    def __init__(self, name_, targetFileName_, maxSize_ = 0, workdir_ = ''):
+    def __init__(self, name_, targetFileName_, maxSize = 0, workdir = ''):
         if Hadder.ROOT is None:
             argv = sys.argv
             sys.argv = ['', '-b']
@@ -145,7 +153,7 @@ class Hadder(Reducer):
             Hadder.ROOT.gSystem.Load("libTreePlayer.so")
             sys.argv = argv # sys.argv is read when a first call to ROOT object is made
         
-        Reducer.__init__(self, name_, targetFileName_, maxSize_, workdir_)
+        Reducer.__init__(self, name_, targetFileName_, maxSize, workdir)
 
         self._lock = threading.Lock()
 
@@ -204,8 +212,8 @@ class HEfficiencyAdder(Hadder):
     Hadder with efficiency calculation.
     """
 
-    def __init__(self, name_, targetFileName_, maxSize_ = 0, workdir_ = ''):
-        Hadder.__init__(self, name_, targetFileName_, maxSize_, workdir_)
+    def __init__(self, name_, targetFileName_, maxSize = 0, workdir = ''):
+        Hadder.__init__(self, name_, targetFileName_, maxSize, workdir)
 
     def finalize(self):
         if self._outputNumber != 0:

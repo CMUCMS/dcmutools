@@ -31,6 +31,7 @@ TMPDIR = os.environ['TMPDIR']
 DEBUG = False
 
 SCP = ['scp', '-oStrictHostKeyChecking=no', '-oLogLevel=quiet']
+SSH = ['ssh', '-oStrictHostKeyChecking=no', '-oLogLevel=quiet']
 
 logLock = threading.Lock()
 
@@ -141,7 +142,7 @@ def downloadFiles(workspace_, jobName_, key_, host_, queue_):
                 response = conn.sock.recv(1024)
                 if DEBUG: log(ServerConnection.host + ' says ' + response)
 
-                if response != 'GO':
+                if response != 'OK':
                     raise RuntimeError('no permission')
     
                 scpProc = subprocess.Popen(SCP + [host_ + ':' + remotePath, localPath])
@@ -156,7 +157,7 @@ def downloadFiles(workspace_, jobName_, key_, host_, queue_):
 
             except:
                 log('download request failed in', jobName_, 'due to', sys.exc_info()[0:2], '. retrying')
-                continue
+                break
         else:
             # copied all files in this line
             log('successfully downloaded', localPaths)
@@ -179,11 +180,12 @@ if __name__ == '__main__':
     sys.argv = ['', '-b']
 
     import ROOT
+    ROOT.gErrorIgnoreLevel = ROOT.kError
 
     sys.path.append(workspace)
     from jobconfig import jobConfig
 
-    logFile = open(jobConfig['logDir'] + '/' + jobName + '.log', 'w', 0)
+    logFile = open(jobConfig['logDir'] + '/' + jobName + '.log', 'a', 0)
     sys.stdout = logFile
     sys.stderr = logFile
 
@@ -201,6 +203,7 @@ if __name__ == '__main__':
     conn = ServerConnection('dispatch')
     if DEBUG: log('RUNNING')
     conn.sock.send('RUNNING')
+    conn.sock.recv(1024)
     conn = None # delete the object to close the connection
         
     outputDir = TMPDIR + '/' + jobConfig['key'] + '/output/' + jobName
@@ -216,7 +219,7 @@ if __name__ == '__main__':
     analyzer = getattr(ROOT, jobConfig['analyzer'])()
     analyzer.run._threaded = True
 
-    log('initialization')
+    log('initialize:', outputDir, *arguments)
     if not analyzer.initialize(outputDir, *arguments):
         raise RuntimeError("Worker class initialization")
     
@@ -285,16 +288,25 @@ if __name__ == '__main__':
     
         # copy output files to remote host
 
+        useReducer = jobConfig['reducer'] != 'None' and len(outputContents) == 1 # if only one type of output is produced
+        lfnOutput = jobConfig['outputNode'] == jobConfig['serverHost'] and jobConfig['outputDir'][0:7] == '/store/'
+
         outputContents = os.listdir(outputDir)
+        log('Produced file(s)', outputContents)
+
+        if len(outputContents) == 0:
+            raise RuntimeError("No output");
         
-        if jobConfig['reducer'] != 'None' and len(outputContents) == 1:
-            log('Copying output to', jobConfig['serverHost'])
+        remoteCommands = []
+        
+        if useReducer:
+            log('Copying output for reducer in', jobConfig['serverHost'])
             
             localPath = outputDir + '/' + outputContents[0]
     
             remoteFileName = jobConfig['outputFile']
             remoteFileName = remoteFileName[0:remoteFileName.rfind('.')] + '_' + jobName + remoteFileName[remoteFileName.rfind('.'):]
-    
+  
 #            conn = ServerConnection('reduce')
 #            if DEBUG: log('DEST')
 #            conn.sock.send('DEST')
@@ -302,7 +314,7 @@ if __name__ == '__main__':
 #            if DEBUG: log(ServerConnection.host + ' says ' + response)
 #            remotePath = response + '/' + remoteFileName
 # Choosing to run reducer "offline" and not as a service; adds stability with a price of little time rag after the jobs are done. darun jobs will upload the output to $TMPDIR/{key}
-            remotePath = jobConfig['serverTmpDir'] + '/' + jobConfig['key'] + '/reduce/input/' + remoteFileName
+            remotePath = jobConfig['serverWorkDir'] + '/reduce/input/' + remoteFileName
 
             copyCommands = [SCP + [localPath, jobConfig['serverHost'] + ':' + remotePath]]
             
@@ -310,39 +322,65 @@ if __name__ == '__main__':
             log('Copying output to', jobConfig['outputNode'])
 
             copyCommands = []
-            
+
             for localFileName in outputContents:
                 localPath = outputDir + '/' + localFileName
     
                 remoteFileName = localFileName
                 remoteFileName = remoteFileName[0:remoteFileName.rfind('.')] + '_' + jobName + remoteFileName[remoteFileName.rfind('.'):]
-    
+
                 remotePath = jobConfig['outputDir'] + '/' + remoteFileName
                
                 if jobConfig['outputNode'] == 'eos':
                     copyCommands.append(['cmsStage', localPath, remotePath])
                 else:
+                    if lfnOutput:
+                        remotePath = jobConfig['serverWorkDir'] + '/dscp/' + remoteFileName
+                        
                     copyCommands.append(SCP + [localPath, jobConfig['outputNode'] + ':' + remotePath])
+
+        if lfnOutput:
+            dscp = ServerConnection('dscp')
+            if dscp is None:
+                raise RuntimeError('Cannot establish connection to DSCP server')
+        else:
+            dscp = None
 
         for command in copyCommands:
             iTry = 0
             while iTry < 3:
+                log(command)
                 copyProc = subprocess.Popen(command, stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
                 while copyProc.poll() is None: time.sleep(2)
         
                 if copyProc.returncode == 0:
-                    if DEBUG: log(command)
+                    if DEBUG: log('Copy success')
 
-#                    conn.sock.send(remoteFileName)
-#                    response = conn.sock.recv(1024)
-#                    if DEBUG: log(ServerConnection.host + ' says ' + response)
-#                    conn = None
-#                    if response == 'FAILED':
-#                        continue
+                    #if useReducer:                    
+                    #    conn.sock.send(remoteFileName)
+                    #    response = conn.sock.recv(1024)
+                    #    if DEBUG: log(ServerConnection.host + ' says ' + response)
+                    #    conn = None
+                    #    if response == 'FAILED':
+                    #        continue
+
+                    if lfnOutput:
+                        remotePath = command[-1]
+                        if ':' in remotePath: # has to be the case..
+                            remotePath = remotePath[remotePath.find(':') + 1:]
+
+                        log('dscp', remotePath)
+                        
+                        if DEBUG: log(remotePath)
+                        dscp.sock.send(remotePath)
+                        response = dscp.sock.recv(1024)
+                        if DEBUG: log(ServerConnection.host + ' says ' + response)
+                        if response == 'FAILED':
+                            raise RuntimeError('DSCP failed')
                         
                     break
                 else:
-                    if DEBUG: log(command, 'failed')
+                    log(command, 'failed')
 
 #                    conn.sock.send('FAIL')
 #                    conn.sock.recv(1024)
@@ -351,12 +389,16 @@ if __name__ == '__main__':
                 iTry += 1
             else:
                 raise RuntimeError('copy failure')
-    
+
+        dscp.sock.send('DONE')
+        dscp = None        
+
         # report to dispatcher
-    
+        
         conn = ServerConnection('dispatch')
         if DEBUG: log('DONE')
         conn.sock.send('DONE')
+        conn.sock.recv(1024)
         conn = None
 
         log('Done.')
@@ -371,6 +413,7 @@ if __name__ == '__main__':
         if DEBUG: log('FAILED')
         if conn.sock:
             conn.sock.send('FAILED')
+            conn.sock.recv(1024)
         conn = None
         
         log('Aborted.')

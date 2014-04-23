@@ -27,24 +27,11 @@ import Queue
 srcdir = os.path.dirname(os.path.realpath(__file__))
 if srcdir not in sys.path:
     sys.path.append(srcdir)
-from daserver import DAServer
+from globals import *
+from daserver import *
 from reducer import *
 from terminal import Terminal
-
-MINPORT = 40000
-MAXPORT = 40001
-DCMUHOST = "dcmu00"
-TERMNODE = 'lxplus'
-CMSSW_BASE = "/afs/cern.ch/user/y/yiiyama/cmssw/SLC6Ntuplizer5314"
-HTMLDIR = '/afs/cern.ch/user/y/yiiyama/www/dap'
-USER = os.environ['USER']
-try:
-    TMPDIR = os.environ['TMPDIR']
-except KeyError:
-    TMPDIR = '/tmp/' + USER
-
-DEBUG = False
-SERVERONLY = False # for debugging purpose
+from dscp import dscp
 
 
 class DelegatingTCPServer(SocketServer.ThreadingTCPServer):
@@ -267,6 +254,7 @@ class DADispatcher(DAServer):
 
         try:
             state = request_.recv(1024)
+            request_.send('OK')
             self.log('Set state', jobName_, state)
         except:
             state = 'UNKNOWN'
@@ -296,12 +284,12 @@ class DADispatcher(DAServer):
         self._jobInfo[jobName_] = DADispatcher.JobInfo(jobName_)
         self._readyJobs.append(self._jobInfo[jobName_])
 
-    def submitOne(self, bsubOptions = '', setenv = '', logdir = ''):
+    def submitOne(self, bsubOptions = '', logdir = ''):
         if len(self._readyJobs):
             jobInfo = self._readyJobs[0]
-            self.submit(jobInfo, bsubOptions, setenv, logdir)
+            self.submit(jobInfo, bsubOptions, logdir)
 
-    def submit(self, jobInfo_, bsubOptions = '', setenv = '', logdir = ''):
+    def submit(self, jobInfo_, bsubOptions = '', logdir = ''):
         with self._lock:
             try:
                 self._readyJobs.remove(jobInfo_)
@@ -316,11 +304,11 @@ class DADispatcher(DAServer):
             logdir = self._workspace + '/logs'
 
         if self._dispatchMode == 'bsub':
-            command = "bsub {options} -J {jobName} -o {log} '{setenv}darun.py {workspace} {jobName}'".format(
-                options = bsubOptions,
+            command = "bsub -J {jobName} -o {log} -cwd '$TMPDIR' {options} 'source {environment};darun.py {workspace} {jobName}'".format(
                 jobName = jobInfo_.name,
                 log = logdir + '/' + jobInfo_.name + '.log',
-                setenv = setenv,
+                options = bsubOptions,
+                environment = self._workspace + '/environment',
                 workspace = self._workspace
             )
 
@@ -349,8 +337,8 @@ class DADispatcher(DAServer):
             proc = None
 
         elif self._dispatchMode == 'lxplus':
-            command = '{setenv}darun.py {workspace} {jobName} > {log} 2>&1;exit'.format(
-                setenv = setenv,
+            command = 'cd $TMPDIR;source {environment};darun.py {workspace} {jobName} > {log} 2>&1;exit'.format(
+                environment = self._workspace + '/environment',
                 workspace = self._workspace,
                 jobName = jobInfo_.name,
                 log = logdir + '/' + jobInfo_.name + '.log'
@@ -368,8 +356,9 @@ class DADispatcher(DAServer):
             proc = term
 
         elif self._dispatchMode == 'local':
-            command = '{setenv}darun.py {workspace} {jobName}'.format(
-                setenv = setenv,
+            command = 'cd {tmpdir};source {environment};darun.py {workspace} {jobName}'.format(
+                tmpdir = TMPDIR,
+                environment = self._workspace + '/environment',
                 workspace = self._workspace,
                 jobName = jobInfo_.name
             )
@@ -378,10 +367,10 @@ class DADispatcher(DAServer):
 
             proc = subprocess.Popen(command,
                                     shell = True,
-                                    stdin = PIPE,
-                                    stdout = open(logdir + '/' + jobInfo_.name + '.log', 'w'),
+                                    stdin = subprocess.PIPE,
+                                    stdout = subprocess.PIPE,
                                     stderr = subprocess.STDOUT
-                                )
+                                ) # stdout will be redirected to a log file within the job
 
             self.log('Subprocess started')
 
@@ -394,7 +383,7 @@ class DADispatcher(DAServer):
             jobInfo_.proc = proc
             jobInfo_.node = node
 
-    def dispatch(self, subMax_, bsubOptions = '', setenv = '', logdir = ''):
+    def dispatch(self, subMax_, bsubOptions = '', logdir = ''):
         lastUpdateTime = time.time()
         
         while True:
@@ -403,7 +392,7 @@ class DADispatcher(DAServer):
                 nRunning = len(self._runningJobs)
             
             if nReady != 0 and nRunning < subMax_:
-                self.submitOne(bsubOptions, setenv, logdir)
+                self.submitOne(bsubOptions, logdir)
                 continue
 
             if nReady == 0 and nRunning == 0:
@@ -483,6 +472,10 @@ class DADispatcher(DAServer):
 
     def setWebDir(self, dir_):
         self._webDir = dir_
+        try:
+            os.mkdir(self._webDir)
+        except OSError:
+            pass
 
     def printStatus(self):
         jobCounts = self.countJobs()
@@ -503,7 +496,7 @@ class DADispatcher(DAServer):
         if copyLogs:
             logDir = self._webDir + '/logs'
             if not os.path.exists(logDir):
-                os.makedirs(logDir)
+                os.mkdir(logDir)
 
             for fileName in os.listdir(self._workspace + '/logs'):
                 sourceName = self._workspace + '/logs/' + fileName
@@ -524,7 +517,8 @@ class DADispatcher(DAServer):
         if not os.path.exists(statusDir):
             os.makedirs(statusDir)
             for job in allJobs:
-                open(statusDir + '/' + job + '.UNKNOWN', 'w').close()
+                with open(statusDir + '/' + job + '.UNKNOWN', 'w') as log:
+                    pass
 
         with self._lock:
             for statusFile in os.listdir(statusDir):
@@ -533,9 +527,9 @@ class DADispatcher(DAServer):
                 actual = self._jobInfo[jobName].state
                 if current != actual:
                     os.rename(statusDir + '/' + statusFile, statusDir + '/' + jobName + '.' + actual)
-       
+
                 
-class DownloadRequestServer(DAServer):
+class DownloadRequestServer(QueuedServer):
     """
     Service for download traffic control. Serializes multiple requests to a single resource (disk).
     Protocol:
@@ -545,33 +539,58 @@ class DownloadRequestServer(DAServer):
 
     MAXDEPTH = 6
 
-    def __init__(self, name_):
-        DAServer.__init__(self, name_)
+    def _serveOne(self, request_, jobName_):
+        while True:
+            response = request_.recv(1024)
+            request_.send('OK')
+            if response == 'DONE': break
         
-        self._queue = Queue.Queue(DownloadRequestServer.MAXDEPTH)
-        self._lock = threading.Lock()
-        
-    def canServe(self, jobName_):
-        if not self._queue.full(): return 1
-        else: return 0
 
-    def serve(self, request_, jobName_):
-        self._queue.put(request_)
-        if DEBUG: self.log('Queued job', jobName_)
+class DSCPServer(QueuedServer):
+    """
+    Service for handling LFN creation. Second argument is the path to the working directory.
+    The directory must exist if a non-empty string is passed.
+    """
 
-        with self._lock:
+    MAXDEPTH = 0
+
+    def __init__(self, name_, targetLFDir_, workdir = ''):
+        QueuedServer.__init__(self, name_)
+
+        self._targetDir = targetLFDir_
+        self.workdir = workdir
+
+        if not self.workdir:
             while True:
+                self.workdir = TMPDIR + '/' + string.join(random.sample(string.ascii_lowercase, 6), '')
                 try:
-                    request = self._queue.get(block = False) # will raise Queue.Empty exception when empty
-                    while True:
-                        response = request.recv(1024)
-                        if response == 'DONE': break
-                        request.send('GO')
-                except Queue.Empty:
-                    break
-                except:
-                    self.log('Communication with ' + jobName_ + ' failed: ' + str(sys.exc_info()[0:2]))
-                    break
+                    os.mkdir(self.workdir)
+                except OSError:
+                    pass
+
+        if DEBUG: self.log('Working directory', self.workdir)
+
+    def _serveOne(self, request_, jobName_):
+        while True:
+            fileName = request_.recv(1024)
+
+            if fileName == 'DONE':
+                request_.send('OK')
+                break
+
+            if not os.path.exists(fileName):
+                self.log(fileName, 'does not exist')
+                raise RuntimeError('NoFile')
+
+            try:
+                success = dscp(fileName, self._targetDir + '/' + os.path.basename(fileName), self.log)
+                if not success:
+                    self.log(fileName, 'was not copied to', self._targetDir)
+            except:
+                self.log('Error in copying', fileName)
+                raise RuntimeError('CopyError')
+
+            request_.send('OK')
 
 
 if __name__ == '__main__':
@@ -585,15 +604,13 @@ if __name__ == '__main__':
         except IOError:
             pass
 
-    SETENV = 'cd ' + CMSSW_BASE + ';eval `scram runtime -sh`'
-
     from optparse import OptionParser, OptionGroup
 
-    parser = OptionParser(usage="usage: %prog [options] dataset [dataset2 [dataset3 ...]] macro")
+    parser = OptionParser(usage = "usage: %prog [options] dataset [dataset2 [dataset3 ...]] macro")
 
     execOpts = OptionGroup(parser, "Job execution options", "These options will be saved in the job configuration and will be used at each job execution.")
     execOpts.add_option("-w", "--workspace", dest = 'workspace', help = 'Name of the job directory', default = "", metavar = "DIR")
-    execOpts.add_option("-e", "--setenv", dest = 'setenv', help = 'Command to issue before running the job. Default sets CMSSW environment for bash.', default = SETENV, metavar = "CMD")
+    execOpts.add_option("-e", "--environment", dest = 'environment', help = 'List of commands to set up the job environment. Defaults to the output of "scram runtime -sh" in CMSSW_BASE.', default = DEFAULTENV, metavar = "CMD")
     execOpts.add_option("-a", "--analyzer-arguments", dest = 'analyzerArguments', help = "Arguments to be passed to the initialize() function of the analyzer object.", default = "", metavar = "ARGS")
     execOpts.add_option("-I", "--include", dest = "includePaths", help = "Include path for compilation", default = "", metavar = "-IDIR1 [-IDIR2 [-IDIR3 ...]]")
     execOpts.add_option("-l", "--lib", dest = "libraries", help = "Libraries to load", default = "", metavar = "LIB1[,LIB2[,LIB3...]]")
@@ -645,6 +662,12 @@ if __name__ == '__main__':
     jobKey = string.join(random.sample(string.ascii_lowercase, 4), '')
 
     tcpServer = DelegatingTCPServer(jobKey)
+
+    ### OPEN TERMINAL ###
+
+    if DEBUG: print "opening terminal"
+
+    terminal = Terminal(TERMNODE)
 
     ### CONFIGURATION ###
 
@@ -706,9 +729,18 @@ if __name__ == '__main__':
         jobConfig["reducer"] = options.reducer.strip()
         jobConfig["maxSize"] = options.maxSize
 
-        jobConfig["setenv"] = options.setenv.strip().rstrip(';')
-        if jobConfig['setenv']:
-            jobConfig['setenv'] += '; '
+        ### OPEN WORKSPACE ###
+
+        os.mkdir(workspace)
+        os.mkdir(workspace + '/inputs')
+        os.mkdir(workspace + '/logs')
+
+        if options.environment.strip():
+            cmds = terminal.communicate(options.environment.strip())
+            with open(workspace + '/environment', 'w') as envFile:
+                for cmd in cmds:
+                    envFile.write(cmd + '\n')
+
 
     print 'Using {0} as workspace'.format(workspace)
 
@@ -717,17 +749,11 @@ if __name__ == '__main__':
     jobConfig['key'] = jobKey
     jobConfig['serverHost'] = os.environ['HOSTNAME']
     jobConfig['serverPort'] = tcpServer.server_address[1]
-    jobConfig['serverTmpDir'] = TMPDIR
+    jobConfig['serverWorkDir'] = TMPDIR + '/' + jobKey
     jobConfig["logDir"] = HTMLDIR + '/' + jobKey + '/logs'
-
     # In principle log directory can be anywhere; we are choosing it to be directly in the HTMLDIR for convenience
 
-    ### OPEN WORKSPACE ###
-
-    if not resubmit:
-        os.mkdir(workspace)
-        os.mkdir(workspace + '/inputs')
-        os.mkdir(workspace + '/logs')
+    ### SAVE JOB CONFIGURATION ###
 
     with open(workspace + '/jobconfig.py', 'w') as configFile:
         configFile.write('jobConfig = ' + str(jobConfig))
@@ -848,12 +874,6 @@ if __name__ == '__main__':
         print 'no matching jobs found. exiting.'
         sys.exit(0)
 
-    ### OPEN TERMINAL ###
-
-    if DEBUG: print "opening terminal"
-
-    terminal = Terminal(TERMNODE)
-
     ### MACRO ###
 
     print 'Checking ' + jobConfig['macro']
@@ -897,7 +917,7 @@ if __name__ == '__main__':
 
             configFile.write(')\n')
     
-    terminal.communicate(jobConfig['setenv'] + 'cd ' + workspace + ';python macro.py > logs/compile.log 2>&1')
+    terminal.communicate('cd ' + workspace + ';source environment;python macro.py > logs/compile.log 2>&1')
 
     with open(workspace + '/logs/compile.log', 'r') as logFile:
         for line in logFile:
@@ -919,15 +939,18 @@ if __name__ == '__main__':
         if not jobConfig['outputFile']:
             raise RuntimeError('Reducer requires output file name specification')
 
-        try:
-            os.mkdir(tmpWorkspace + '/reduce')
-        except OSError:
-            pass
+        os.mkdir(tmpWorkspace + '/reduce')
 
-        reducer = eval(jobConfig['reducer'])('reduce', jobConfig['outputFile'], jobConfig['maxSize'], tmpWorkspace + '/reduce')
+        reducer = eval(jobConfig['reducer'])('reduce', jobConfig['outputFile'], maxSize = jobConfig['maxSize'], workdir = tmpWorkspace + '/reduce')
         reducer.setLog(tcpServer.log)
-#        tcpServer.addService(reducer)
-# Choosing to run reducer "offline" and not as a service; adds stability with a price of little time rag after the jobs are done. darun jobs will upload the output to $TMPDIR/{key}/reduce
+        # tcpServer.addService(reducer)
+        # Choosing to run reducer "offline" and not as a service; adds stability with a price of little time rag after the jobs are done. darun jobs will upload the output to $TMPDIR/{key}/reduce
+
+    if jobConfig['outputNode'] == os.environ['HOSTNAME'] and jobConfig['outputDir'][0:7] == '/store/':
+        # The output is an LFN on this storage element.
+        # If reducer is ON, DSCP will be executed from Reducer.copyOutputTo().
+        os.mkdir(tmpWorkspace + '/dscp')
+        tcpServer.addService(DSCPServer('dscp', jobConfig['outputDir'], workdir = tmpWorkspace + '/dscp'))
 
     # dispatcher
     dispatcher = DADispatcher(workspace, options.client, resubmit = options.autoResubmit, terminal = terminal)
@@ -960,7 +983,10 @@ if __name__ == '__main__':
 
     print 'Start job submission'
 
-    dispatcher.dispatch(options.maxParallel, bsubOptions = options.bsubOptions, setenv = jobConfig['setenv'], logdir = jobConfig['logDir'])
+    try:
+        dispatcher.dispatch(options.maxParallel, bsubOptions = options.bsubOptions, logdir = jobConfig['logDir'])
+    except KeyboardInterrupt:
+        pass
 
     dispatcher.printStatus()
     dispatcher.printStatusWeb()
@@ -970,7 +996,7 @@ if __name__ == '__main__':
     completed = True
 
     if dispatcher.countJobs()['DONE'] != len(allJobs):
-        print 'There are failed jobs.'
+        print 'Some jobs are not in DONE state.'
         completed = False
 
     ### REDUCER ###
@@ -984,7 +1010,11 @@ if __name__ == '__main__':
         reducer.reduce()
         reducer.finalize()
 
-        if reducer.copyOutputTo(jobConfig['outputNode'] + ':' + jobConfig['outputDir']):
+        dest = jobConfig['outputDir']
+        if jobConfig['outputNode'] != os.environ['HOSTNAME']:
+            dest = jobConfig['outputNode'] + ':' + dest
+
+        if reducer.copyOutputTo(dest):
             if len(reducer.succeeded) != len(allJobs):
                 print 'Number of input files to reducer does not match the number of jobs: {0}/{1}'.format(len(reducer.succeeded), len(allJobs))
             elif len(reducer.failed):

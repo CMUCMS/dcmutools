@@ -1,10 +1,14 @@
+import os
 import sys
 import subprocess
 import signal
 import time
 
-DEBUG = False
-            
+srcdir = os.path.dirname(os.path.realpath(__file__))
+if srcdir not in sys.path:
+    sys.path.append(srcdir)
+from globals import *
+
 class Terminal:
     """
     A wrapper for an ssh session.
