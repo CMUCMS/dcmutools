@@ -64,20 +64,18 @@ class ServerConnection(object):
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 if DEBUG: log('Connect to', (ServerConnection.host, ServerConnection.port))
                 self.sock.connect((ServerConnection.host, ServerConnection.port))
-                if DEBUG: log(ServerConnection.key)
-                self.sock.send(ServerConnection.key)
-                response = self.sock.recv(1024)
-                if DEBUG: log(ServerConnection.host + ' says ' + response)
-                if response != 'JOB':
-                    raise Exception()
-                if DEBUG: log(ServerConnection.jobName)
-                self.sock.send(ServerConnection.jobName)
+
+                if DEBUG: log(ServerConnection.jobName + ' ' + ServerConnection.key)
+                self.sock.send(ServerConnection.jobName + ' ' + ServerConnection.key)
+                
                 response = self.sock.recv(1024)
                 if DEBUG: log(ServerConnection.host + ' says ' + response)
                 if response != 'SVC':
                     raise Exception()
+                
                 if DEBUG: log(service_)
                 self.sock.send(service_)
+                
                 response = self.sock.recv(1024)
                 if DEBUG: log(ServerConnection.host + ' says ' + response)
                 if response == 'ACCEPT':
@@ -115,7 +113,7 @@ class ServerConnection(object):
             pass
     
     
-def downloadFiles(workspace_, jobName_, key_, host_, queue_):
+def downloadFiles(workspace_, jobName_, taskID_, host_, queue_):
 
     inputList = []
     with open(workspace_ + '/inputs/' + jobName_) as inputListFile:
@@ -130,7 +128,7 @@ def downloadFiles(workspace_, jobName_, key_, host_, queue_):
         for diskName, remotePath in inputLine:
             log('downloading file', remotePath)
 
-            localPath = TMPDIR + '/' + key_ + '/input/' + jobName_ + '/' + remotePath[remotePath.rfind('/') + 1:]
+            localPath = TMPDIR + '/' + taskID_ + '/input/' + jobName_ + '/' + remotePath[remotePath.rfind('/') + 1:]
 
             conn = ServerConnection(diskName)
             if conn.sock is None:
@@ -190,10 +188,20 @@ def downloadFiles(workspace_, jobName_, key_, host_, queue_):
     log('downloader returning')
 
 
+def heartbeat():
+    while True:
+        conn = ServerConnection('dispatch')
+        if conn.sock:
+            conn.sock.send('HB')
+            conn.sock.recv(1024)
+            conn = None
+
+        time.sleep(60)
+
+        
 if __name__ == '__main__':
     
-    workspace = sys.argv[1]
-    jobName = sys.argv[2]
+    workspace, jobName, key = sys.argv[1:]
 
     sys.argv = ['', '-b']
 
@@ -211,7 +219,7 @@ if __name__ == '__main__':
 
     from macro import arguments # worker source code loaded to ROOT here
 
-    ServerConnection.key = jobConfig['key']
+    ServerConnection.key = key
     ServerConnection.jobName = jobName
     ServerConnection.host = jobConfig['serverHost']
     ServerConnection.port = jobConfig['serverPort']
@@ -224,8 +232,8 @@ if __name__ == '__main__':
     conn.sock.recv(1024)
     conn = None # delete the object to close the connection
         
-    outputDir = TMPDIR + '/' + jobConfig['key'] + '/output/' + jobName
-    inputDir = TMPDIR + '/' + jobConfig['key'] + '/input/' + jobName
+    outputDir = TMPDIR + '/' + jobConfig['taskID'] + '/output/' + jobName
+    inputDir = TMPDIR + '/' + jobConfig['taskID'] + '/input/' + jobName
 
     shutil.rmtree(outputDir, ignore_errors = True)
     shutil.rmtree(inputDir, ignore_errors = True)
@@ -247,9 +255,15 @@ if __name__ == '__main__':
     
     log('starting downloader')
     
-    downloadThread = threading.Thread(target = downloadFiles, args = (workspace, jobName, jobConfig['key'], jobConfig['serverHost'], fileNameQueue))
+    downloadThread = threading.Thread(target = downloadFiles, args = (workspace, jobName, jobConfig['taskID'], jobConfig['serverHost'], fileNameQueue))
     downloadThread.daemon = True
     downloadThread.start()
+
+    log('starting heartbeat')
+
+    heartbeatThread = threading.Thread(target = heartbeat)
+    heartbeatThread.daemon = True
+    heartbeatThread.start()
 
     try:
         # start looping over downloaded files
@@ -306,15 +320,15 @@ if __name__ == '__main__':
     
         # copy output files to remote host
 
-        useReducer = jobConfig['reducer'] != 'None' and len(outputContents) == 1 # if only one type of output is produced
-        lfnOutput = jobConfig['outputNode'] == jobConfig['serverHost'] and jobConfig['outputDir'][0:7] == '/store/'
-
         outputContents = os.listdir(outputDir)
         log('Produced file(s)', outputContents)
 
         if len(outputContents) == 0:
             raise RuntimeError("No output");
-        
+
+        useReducer = jobConfig['reducer'] != 'None' and len(outputContents) == 1 # if only one type of output is produced
+        outputIsLFN = jobConfig['outputNode'] == jobConfig['serverHost'] and jobConfig['outputDir'][0:7] == '/store/'
+
         remoteCommands = []
         
         if useReducer:
@@ -331,7 +345,7 @@ if __name__ == '__main__':
 #            response = conn.sock.recv(1024)
 #            if DEBUG: log(ServerConnection.host + ' says ' + response)
 #            remotePath = response + '/' + remoteFileName
-# Choosing to run reducer "offline" and not as a service; adds stability with a price of little time rag after the jobs are done. darun jobs will upload the output to $TMPDIR/{key}
+# Choosing to run reducer "offline" and not as a service; adds stability with a price of little time rag after the jobs are done. darun jobs will upload the output to $TMPDIR/{taskID}
             remotePath = jobConfig['serverWorkDir'] + '/reduce/input/' + remoteFileName
 
             copyCommands = [SCP + [localPath, jobConfig['serverHost'] + ':' + remotePath]]
@@ -352,12 +366,12 @@ if __name__ == '__main__':
                 if jobConfig['outputNode'] == 'eos':
                     copyCommands.append(['cmsStage', localPath, remotePath])
                 else:
-                    if lfnOutput:
+                    if outputIsLFN:
                         remotePath = jobConfig['serverWorkDir'] + '/dscp/' + remoteFileName
                         
                     copyCommands.append(SCP + [localPath, jobConfig['outputNode'] + ':' + remotePath])
 
-        if lfnOutput:
+        if outputIsLFN:
             dscp = ServerConnection('dscp')
             if dscp is None:
                 raise RuntimeError('Cannot establish connection to DSCP server')
@@ -382,7 +396,7 @@ if __name__ == '__main__':
                     #    if response == 'FAILED':
                     #        continue
 
-                    if lfnOutput:
+                    if outputIsLFN:
                         remotePath = command[-1]
                         if ':' in remotePath: # has to be the case..
                             remotePath = remotePath[remotePath.find(':') + 1:]
@@ -408,8 +422,9 @@ if __name__ == '__main__':
             else:
                 raise RuntimeError('copy failure')
 
-        dscp.sock.send('DONE')
-        dscp = None        
+        if dscp:
+            dscp.sock.send('DONE')
+            dscp = None        
 
         # report to dispatcher
         

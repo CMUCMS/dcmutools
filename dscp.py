@@ -33,7 +33,7 @@ def dscp(source, lfn, logfunc):
         os.makedirs(lfdir)
 
     try:
-        target = min(disks, key = lambda d : os.statvfs(d).f_bavail)
+        target = max(disks, key = lambda d : os.statvfs(d).f_bavail)
     except:
         target = disks[random.randint(0, len(disks) - 1)]
 

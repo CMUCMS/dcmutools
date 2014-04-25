@@ -14,9 +14,10 @@ class Terminal:
     A wrapper for an ssh session.
     """
 
-    def __init__(self, servName_):
+    def __init__(self, servName_, verbose = False):
         self._servName = servName_
         self._session = None
+        self._verbose = verbose
         self.node = ''
         self.open()
 
@@ -33,7 +34,7 @@ class Terminal:
 	    preexec_fn = lambda : signal.signal(signal.SIGINT, signal.SIG_IGN))
         
         self.node = self.communicate('echo $HOSTNAME')[0]
-        print 'Terminal opened on ' + self.node
+        if self._verbose: print 'Terminal opened on ' + self.node
         
     def close(self, force = False):
         if not self.isOpen(): return
@@ -54,7 +55,7 @@ class Terminal:
         except OSError:
             pass
         except:
-            print 'Failed to close SSH connection:', sys.exc_info()[0:2]
+            if self._verbose: print 'Failed to close SSH connection:', sys.exc_info()[0:2]
 
     def isOpen(self):
         return self._session and self._session.poll() is None
@@ -63,7 +64,7 @@ class Terminal:
         try:
             self._session.stdin.write(line_.strip() + '\n')
         except:
-            print 'Failed to write {0} to terminal'.format(line_.strip()), sys.exc_info()[0:2]
+            if self._verbose: print 'Failed to write {0} to terminal'.format(line_.strip()), sys.exc_info()[0:2]
             self.close(True)
             self.open()
 
@@ -72,7 +73,7 @@ class Terminal:
         try:
             response = self._session.stdout.readline().strip()
         except:
-            print 'Failed to read from terminal', sys.exc_info()[0:2]
+            if self._verbose: print 'Failed to read from terminal', sys.exc_info()[0:2]
             self.close(True)
             self.open()
 

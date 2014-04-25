@@ -28,7 +28,6 @@ srcdir = os.path.dirname(os.path.realpath(__file__))
 if srcdir not in sys.path:
     sys.path.append(srcdir)
 from globals import *
-from daserver import *
 from reducer import *
 from terminal import Terminal
 from dscp import dscp
@@ -38,13 +37,13 @@ SERVERONLY = False # for debugging purpose
 
 class DelegatingTCPServer(SocketServer.ThreadingTCPServer):
     """
-    Threading TCP server with list of services to be provided. Each client must provide the verification key and declare the necessary
-    service during the initial handshake.
+    Threading TCP server with list of services to be provided. Each client authenticates with its id-key pair
+    during the initial handshake.
     The implementation does not follow the original design concept of SocketServer in that no RequestHandlerClass is used.
     This is to eliminate the communication cost between the server and the handler object.
     """
 
-    def __init__(self, key_):
+    def __init__(self):
         if DEBUG: print 'Initializing ThreadingTCPServer'
 
         port = MINPORT
@@ -57,7 +56,6 @@ class DelegatingTCPServer(SocketServer.ThreadingTCPServer):
                     raise
                 port += 1
 
-        self._key = key_
         self._logLines = Queue.Queue()
         self._log = sys.stdout
         self._services = {}
@@ -66,36 +64,18 @@ class DelegatingTCPServer(SocketServer.ThreadingTCPServer):
     def setLog(self, logFileName_):
         self._log = open(logFileName_, 'w', 0)
 
-    def verify_request(self, request_, clientAddress_):
-        request_.settimeout(180)
-        try:
-            self.log('Request received from' + str(clientAddress_))
-
-            key = request_.recv(1024)
-            if key != self._key:
-                raise RuntimeError("Wrong key")
-
-            if DEBUG: self.log('Key verified for ' + str(clientAddress_))
-        except:
-            self.log('Handshake exception ' + str(sys.exc_info()[0:2]))
-            try:
-                request_.send('REJECT')
-            except:
-                if DEBUG: self.log('Failed to send REJECT ' + str(sys.exc_info()[0:2]))
-                pass
-
-            self.close_request(request_)
-            
-            return False
-
-        return True
+    def verify_request(self, request_, clientAddr_):
+        return 'dispatch' in self._services
 
     def process_request_thread(self, request_, clientAddr_):
         jobName = 'unknown'
         serviceName = 'unknown'
         try:
-            request_.send('JOB')
-            jobName = request_.recv(1024)
+            jobName, key = request_.recv(1024).split()
+
+            if not self._services['dispatch'].authenticate(jobName, key):
+                raise RuntimeError('Wrong id-key pair: ' + str((jobName, key)))
+                
             request_.send('SVC')
             serviceName = request_.recv(1024)
             
@@ -107,27 +87,15 @@ class DelegatingTCPServer(SocketServer.ThreadingTCPServer):
             if vcode == 1:
                 request_.send('ACCEPT')
 
-                if DEBUG: self.log('Handshake complete with ' + str(clientAddr_))
-
                 # now delegate the actual task to service
-                try:
-                    if DEBUG: self.log('Passing ' + jobName + ' to ' + serviceName)
-                    service.serve(request_, jobName)
-                except:
-                    if DEBUG: self.log('Service exception ' + str(sys.exc_info()[0:2]))
-                    try:
-                        request_.send('REJECT')
-                    except:
-                        if DEBUG: self.log('Failed to send REJECT ' + str(sys.exc_info()[0:2]))
-                        pass
+                if DEBUG: self.log('Passing ' + jobName + ' to ' + serviceName)
+                service.serve(request_, jobName)
 
             elif vcode == 0:
                 request_.send('WAIT')
+
             else:
                 raise RuntimeError(serviceName + ' cannot serve ' + jobName)
-
-            # let the client close the connection first; frees up server from having to stay in TIME_WAIT
-            request_.recv(1024)
         except:
             self.log('Process request exception ' + str(sys.exc_info()[0:2]))
             try:
@@ -136,10 +104,15 @@ class DelegatingTCPServer(SocketServer.ThreadingTCPServer):
                 if DEBUG: self.log('Failed to send REJECT ' + str(sys.exc_info()[0:2]))
                 pass
 
+        # let the client close the connection first; frees up server from having to stay in TIME_WAIT
+        request_.recv(1024)
         self.close_request(request_)
         self.log('Closed request from ' + jobName + ' for ' + serviceName)
 
     def start(self):
+        if 'dispatch' not in self._services:
+            raise RuntimeError('Server cannot start without dispatcher')
+        
         thread = threading.Thread(target = self.serve_forever, name = 'tcpServer')
         thread.daemon = True
         thread.start()
@@ -183,6 +156,25 @@ class DelegatingTCPServer(SocketServer.ThreadingTCPServer):
             os.fsync(self._log)
 
 
+class DAServer(object):
+    """
+    Base service class for DelegatingTCPServer. The protocol is for the server to server listen first.
+    """
+
+    def __init__(self, name_):
+        self.name = name_
+        self.log = lambda *args : sys.stdout.write(self.name + ': ' + string.join(map(str, args)) + '\n')
+
+    def setLog(self, logFunc_):
+        self.log = lambda *args : logFunc_(string.join(map(str, args)), name = self.name)
+
+    def canServe(self, jobName_):
+        return -1
+
+    def serve(self, request_, jobName_):
+        pass
+
+
 class DADispatcher(DAServer):
     """
     Service for job status bookkeeping.
@@ -191,7 +183,7 @@ class DADispatcher(DAServer):
       CLT: send START, EXIT, or DONE
     """
 
-    states = [
+    STATES = [
         'UNKNOWN',
         'CREATED',
         'PENDING',
@@ -201,6 +193,10 @@ class DADispatcher(DAServer):
         'EXITED'
     ]
 
+    CLUSTERS = ['lsf', 'interactive', 'local']
+    FALLBACK = {'lsf': 'interactive', 'interactive': '', 'local': ''}
+    MAXACTIVE = {'lsf': 40, 'interactive': 20, 'local': 20}
+
     class JobInfo(object):
         """
         Struct for job information.
@@ -208,196 +204,235 @@ class DADispatcher(DAServer):
         
         def __init__(self, name_):
             self.name = name_
-            self.id = ''
+            self.key = string.join(random.sample(string.ascii_lowercase, 4), '')
+            self.cluster = ''
+            self.proc = None
             self.node = ''
             self.state = 'CREATED'
-            self.proc = None
+            self.lastHB = 0
 
                 
-    def __init__(self, workspace_, dispatchMode_, resubmit = False, terminal = None):
+    def __init__(self, workspace_, resubmit = False, terminal = None):
         DAServer.__init__(self, 'dispatch')
         
         self._workspace = workspace_
         self._webDir = ''
-        self._dispatchMode = dispatchMode_
         self._jobInfo = {}
         self._resubmit = resubmit
-        self._readyJobs = []
-        self._runningJobs = []
+        self._readyJobs = dict([(k, []) for k in DADispatcher.CLUSTERS])
+        self._activeJobs = dict([(k, []) for k in DADispatcher.CLUSTERS])
         self._lock = threading.Lock()
         self._update = threading.Event()
         if terminal:
             self._terminal = terminal
         else:
-            self._terminal = Terminal(TERMNODE)
+            self._terminal = Terminal(TERMNODE, verbose = True)
+
+        self.options = dict([(k, '') for k in DADispatcher.CLUSTERS])
 
     def __del__(self):
-        if self._dispatchMode == 'bsub':
-            for jobInfo in self._jobInfo.values():
-                if jobInfo.state == 'RUNNING' or jobInfo.state == 'PENDING':
-                    self._terminal.write('bkill {0}'.format(jobInfo.id))
+        for cluster in DADispatcher.CLUSTERS:
+            for jobInfo in self._activeJobs[cluster]:
+                self.kill(jobInfo)
 
-        elif self._dispatchMode == 'lxplus':
-            for jobInfo in self._jobInfo.values():
-                if jobInfo.proc.isOpen():
-                    jobInfo.proc.close(force = True)
-
-        elif self._dispatchMode == 'local':
-            for jobInfo in self._jobInfo.values():
-                if jobInfo.proc.poll() is None:
-                    jobInfo.proc.terminate()
+    def authenticate(self, jobName_, key_):
+        try:
+            return key_ == self._jobInfo[jobName_].key
+        except:
+            return False
 
     def canServe(self, jobName_):
         if jobName_ in self._jobInfo: return 1
         else: return -1
 
     def serve(self, request_, jobName_):
-        if jobName_ not in self._jobInfo: return
+        jobInfo = self._jobInfo[jobName_]
+
+        jobInfo.lastHB = time.time()
 
         try:
-            state = request_.recv(1024)
+            response = request_.recv(1024)
             request_.send('OK')
-            self.log('Set state', jobName_, state)
+            if response == 'HB':
+                self.log('Heart beat from', jobName_)
+                return
+            else:
+                self.log('Set state', jobName_, response)
         except:
-            state = 'UNKNOWN'
+            response = 'UNKNOWN'
 
         with self._lock:
             try:
-                jobInfo = self._jobInfo[jobName_]
-        
-                jobInfo.state = state
+                jobInfo.state = response
     
-                if state == 'DONE':
-                    self._runningJobs.remove(jobInfo)
-                elif state == 'FAILED':
-                    self._runningJobs.remove(jobInfo)
+                if jobInfo.state == 'DONE':
+                    self._activeJobs[jobInfo.cluster].remove(jobInfo)
+                elif jobInfo.state == 'FAILED':
+                    self._activeJobs[jobInfo.cluster].remove(jobInfo)
                     if self._resubmit:
-                        self._readyJobs.append(jobInfo)
+                        self._readyJobs[jobInfo.cluster].append(jobInfo)
             except:
                 self.log('Exception while serving', jobName_, sys.exc_info()[0:2])
 
-        if state == 'FAILED':
+        if jobInfo.state == 'FAILED':
             with open(self._workspace + '/logs/' + jobName_ + '.fail', 'w') as failLog:
                 pass
 
         self._update.set()
         
-    def createJob(self, jobName_):
-        self._jobInfo[jobName_] = DADispatcher.JobInfo(jobName_)
-        self._readyJobs.append(self._jobInfo[jobName_])
+    def createJob(self, jobName_, cluster_):
+        jobInfo = DADispatcher.JobInfo(jobName_)
+        jobInfo.cluster = cluster_
+        self._jobInfo[jobName_] = jobInfo
+        self._readyJobs[cluster_].append(jobInfo)
+        if DEBUG: self.log('Created', jobName_)
 
-    def submitOne(self, bsubOptions = '', logdir = ''):
-        if len(self._readyJobs):
-            jobInfo = self._readyJobs[0]
-            self.submit(jobInfo, bsubOptions, logdir)
+    def submitOne(self, cluster, logdir = ''):
+        if len(self._activeJobs[cluster]) >= DADispatcher.MAXACTIVE[cluster] or \
+           len(self._readyJobs[cluster]) == 0:
+            return False
 
-    def submit(self, jobInfo_, bsubOptions = '', logdir = ''):
+        jobInfo = self._readyJobs[cluster][0]
+        if DEBUG: self.log('submit', jobInfo.name)
+        return self.submit(jobInfo, logdir)
+
+    def submit(self, jobInfo_, logdir = ''):
         with self._lock:
             try:
-                self._readyJobs.remove(jobInfo_)
+                self._readyJobs[jobInfo_.cluster].remove(jobInfo_)
             except ValueError:
-                return
+                return False
                 
-            self._runningJobs.append(jobInfo_)
+            self._activeJobs[jobInfo_.cluster].append(jobInfo_)
         
         self.log('Submitting job ', jobInfo_.name)
 
         if not logdir:
             logdir = self._workspace + '/logs'
 
-        if self._dispatchMode == 'bsub':
-            command = "bsub -J {jobName} -o {log} -cwd '$TMPDIR' {options} 'source {environment};darun.py {workspace} {jobName}'".format(
-                jobName = jobInfo_.name,
-                log = logdir + '/' + jobInfo_.name + '.log',
-                options = bsubOptions,
-                environment = self._workspace + '/environment',
-                workspace = self._workspace
-            )
-
-            self.log(command)
+        try:
+            if jobInfo_.cluster == 'lsf':
+                command = "bsub -J {jobName} -o {log} -cwd '$TMPDIR' {options} 'source {environment};darun.py {workspace} {jobName} {key}'".format(
+                    jobName = jobInfo_.name,
+                    log = logdir + '/' + jobInfo_.name + '.log',
+                    options = self.options['lsf'],
+                    environment = self._workspace + '/environment',
+                    workspace = self._workspace,
+                    key = jobInfo_.key
+                )
     
-            bsubout = self._terminal.communicate(command)
+                self.log(command)
+        
+                bsubout = self._terminal.communicate(command)
+    
+                success = False
+                if len(bsubout) != 0 and 'submitted' in bsubout[0]:
+                    matches = re.search('<([0-9]+)>', bsubout[0])
+                    if matches:
+                        success = True
+    
+                if not success:
+                    self.log('bsub failed')
+                    raise Exception
+    
+                self.log('lxbatch job ID for {0} is {1}'.format(jobInfo_.name, matches.group(1)))
+    
+                proc = matches.group(1)
+                node = ''
+    
+            elif jobInfo_.cluster == 'interactive':
+                command = 'cd $TMPDIR;source {environment};darun.py {workspace} {jobName} {key} >> {log} 2>&1;exit'.format(
+                    environment = self._workspace + '/environment',
+                    workspace = self._workspace,
+                    jobName = jobInfo_.name,
+                    key = jobInfo_.key,
+                    log = logdir + '/' + jobInfo_.name + '.log'
+                )
+    
+                self.log(command)
+    
+                term = Terminal(TERMNODE)
+                term.write(command)
+    
+                self.log('Command issued to', term.node)
+    
+                proc = term
+                node = term.node
+    
+            elif jobInfo_.cluster == 'local':
+                command = 'cd {tmpdir};source {environment};darun.py {workspace} {jobName} {key}'.format(
+                    tmpdir = TMPDIR,
+                    environment = self._workspace + '/environment',
+                    workspace = self._workspace,
+                    jobName = jobInfo_.name,
+                    key = jobInfo_.key
+                )
+    
+                self.log(command)
+    
+                proc = subprocess.Popen(command,
+                                        shell = True,
+                                        stdin = subprocess.PIPE,
+                                        stdout = subprocess.PIPE,
+                                        stderr = subprocess.STDOUT
+                                    ) # stdout will be redirected to a log file within the job
+    
+                self.log('Subprocess started')
+    
+                node = 'localhost'
 
-            success = False
-            if len(bsubout) != 0 and 'submitted' in bsubout[0]:
-                matches = re.search('<([0-9]+)>', bsubout[0])
-                if matches:
-                    success = True
+        except:
+            with self._lock:
+                self._activeJobs[jobInfo_.cluster].remove(jobInfo_)
+                self._readyJobs[jobInfo_.cluster].append(jobInfo_)
 
-            if not success:
-                self.log('bsub failed')
-                with self._lock:
-                    self._runningJobs.remove(jobInfo_)
-                    self._readyJobs.append(jobInfo_)
-
-                return
-
-            self.log('lxbatch job ID for {0} is {1}'.format(jobInfo_.name, matches.group(1)))
-
-            jobId = matches.group(1)
-            node = ''
-            proc = None
-
-        elif self._dispatchMode == 'lxplus':
-            command = 'cd $TMPDIR;source {environment};darun.py {workspace} {jobName} > {log} 2>&1;exit'.format(
-                environment = self._workspace + '/environment',
-                workspace = self._workspace,
-                jobName = jobInfo_.name,
-                log = logdir + '/' + jobInfo_.name + '.log'
-            )
-
-            self.log(command)
-
-            term = Terminal(TERMNODE)
-            term.write(command)
-
-            self.log('Command issued to', term.node)
-
-            jobId = jobInfo_.name
-            node = term.node
-            proc = term
-
-        elif self._dispatchMode == 'local':
-            command = 'cd {tmpdir};source {environment};darun.py {workspace} {jobName}'.format(
-                tmpdir = TMPDIR,
-                environment = self._workspace + '/environment',
-                workspace = self._workspace,
-                jobName = jobInfo_.name
-            )
-
-            self.log(command)
-
-            proc = subprocess.Popen(command,
-                                    shell = True,
-                                    stdin = subprocess.PIPE,
-                                    stdout = subprocess.PIPE,
-                                    stderr = subprocess.STDOUT
-                                ) # stdout will be redirected to a log file within the job
-
-            self.log('Subprocess started')
-
-            jobId = jobInfo_.name
-            node = 'localhost'
-
+            return False
+            
         with self._lock:
-            jobInfo_.id = jobId
-            jobInfo_.state = 'PENDING'
             jobInfo_.proc = proc
+            jobInfo_.state = 'PENDING'
             jobInfo_.node = node
+            jobInfo_.lastHB = time.time()
 
-    def dispatch(self, subMax_, bsubOptions = '', logdir = ''):
+        return True
+
+    def kill(self, jobInfo_):
+        if jobInfo_.cluster == 'lsf':
+            response = self._terminal.communicate('bkill {0}'.format(jobInfo_.proc))
+            for line in response:
+                self.log(line)
+
+        elif jobInfo_.cluster == 'interactive':
+            if jobInfo_.proc.isOpen():
+                jobInfo_.proc.close(force = True)
+
+        elif jobInfo_.cluster == 'local':
+            if jobInfo_.proc.poll() is None:
+                jobInfo_.proc.terminate()
+
+        try:
+            self._jobInfo.pop(jobInfo_.name)
+        except:
+            self.log('Exception while trying to remove', jobInfo_.name)
+
+    def dispatch(self, logdir = ''):
         lastUpdateTime = time.time()
+
+        self.printStatusWeb()
         
         while True:
-            with self._lock:
-                nReady = len(self._readyJobs)
-                nRunning = len(self._runningJobs)
-            
-            if nReady != 0 and nRunning < subMax_:
-                self.submitOne(bsubOptions, logdir)
-                continue
+            submitted = False
+            for cluster in DADispatcher.CLUSTERS:
+                if self.submitOne(cluster, logdir):
+                    submitted = True
 
-            if nReady == 0 and nRunning == 0:
+            if submitted: continue
+
+            with self._lock:
+                nReady = reduce(lambda x, y : x + y, map(len, self._readyJobs.values()))
+                nActive = reduce(lambda x, y : x + y, map(len, self._activeJobs.values()))
+
+            if nReady == 0 and nActive == 0:
                 break
                 
             self._update.wait(20.)
@@ -411,19 +446,11 @@ class DADispatcher(DAServer):
                 lastUpdateTime = time.time()
 
     def queryJobStates(self):
+        lsfTracked = []
+        lsfNodes = []            
 
-        exited = []
-        def setExited(jobInfo):
-            jobInfo.state = 'EXITED'
-            self._runningJobs.remove(jobInfo)
-            if self._resubmit: self._readyJobs.append(jobInfo)
-            exited.append(jobInfo)
-        
-        try:
-            if self._dispatchMode == 'bsub':
-                lsfTracked = []
-                lsfNodes = []
-
+        if len(self._activeJobs['lsf']) != 0:
+            try:
                 response = self._terminal.communicate('bjobs')[1:]
                 if DEBUG: print 'bjobs', response
     
@@ -433,38 +460,52 @@ class DADispatcher(DAServer):
                     lsfTracked.append(id)
                     lsfNodes.append(node)
 
-                # Two different tasks - if id is in the list of ids, set the node name
-                # if not, the job may have exited abnormally - check state.
-                with self._lock:
-                    for jobInfo in self._jobInfo.values():
-                        if jobInfo.id in lsfTracked:
-                            idx = lsfTracked.index(jobInfo.id)
-                            jobInfo.node = lsfNodes[idx]
-                        elif jobInfo in self._runningJobs:
-                            setExited(jobInfo)
+            except:
+                self.log('Job status query failed')                    
 
-            elif self._dispatchMode == 'lxplus':
-                with self._lock:
-                    for jobInfo in filter(lambda jobInfo : not jobInfo.proc.isOpen(), self._jobInfo.values()):
-                        if jobInfo in self._runningJobs:
-                            setExited(jobInfo)
-    
-            elif self._dispatchMode == 'local':
-                with self._lock:
-                    for jobInfo in filter(lambda jobInfo : jobInfo.proc.poll() is not None, self._jobInfo.values()):
-                        if jobInfo in self._runningJobs:
-                            setExited(jobInfo)
+        exited = []
+        
+        with self._lock:
+            for jobInfo in self._activeJobs['lsf']:
+                # Two different tasks - if id is in the list of ids, set the node name.
+                # If not, the job may have exited abnormally - check state.
+                if jobInfo.proc in lsfTracked and jobInfo.lastHB > time.time() - 180:
+                    idx = lsfTracked.index(jobInfo.proc)
+                    jobInfo.node = lsfNodes[idx]
+                else:
+                    exited.append(jobInfo)
 
-        except:
-            self.log('Job status query failed')
+            for jobInfo in self._activeJobs['interactive']:
+                if not jobInfo.proc.isOpen() or jobInfo.lastHB < time.time() - 180:
+                    exited.append(jobInfo)
+
+            for jobInfo in self._activeJobs['local']:
+                if jobInfo.proc.poll() is not None or jobInfo.lastHB < time.time() - 180:
+                    exited.append(jobInfo)
+
+            for jobInfo in exited:
+                self.log('Set state', jobInfo.name, 'EXITED')
+                jobInfo.state = 'EXITED'
+                self._activeJobs[jobInfo.cluster].remove(jobInfo)
+
+                if self._resubmit:
+                    self.kill(jobInfo) # removes from self._jobInfo
+                    cluster = jobInfo.cluster
+                    fallback = DADispatcher.FALLBACK[cluster]
+                    if fallback and len(self._activeJobs[fallback]) < DADispatcher.MAXACTIVE[fallback]:
+                        self.log('Submission of', jobInfo.name, 'falling back to', fallback)
+                        cluster = fallback
+                        
+                    self.createJob(jobInfo.name, cluster)
+
+                self._update.set()
 
         for jobInfo in exited:
-            self.log('Set state', jobInfo.name, 'EXITED')
             with open(self._workspace + '/logs/' + jobInfo.name + '.fail', 'w') as failLog:
                 pass
 
     def countJobs(self):
-        jobCounts = dict((key, 0) for key in DADispatcher.states)
+        jobCounts = dict((key, 0) for key in DADispatcher.STATES)
 
         with self._lock:
             for jobInfo in self._jobInfo.values():
@@ -483,7 +524,7 @@ class DADispatcher(DAServer):
         jobCounts = self.countJobs()
 
         line = ''
-        for state in DADispatcher.states:
+        for state in DADispatcher.STATES:
             line += ' {state}: {n}'.format(state = state, n = jobCounts[state])
 
         line = '\r' + line
@@ -525,12 +566,82 @@ class DADispatcher(DAServer):
         with self._lock:
             for statusFile in os.listdir(statusDir):
                 jobName = statusFile[:statusFile.rfind('.')]
+                if jobName not in self._jobInfo: continue
                 current = statusFile[statusFile.rfind('.') + 1:]
                 actual = self._jobInfo[jobName].state
                 if current != actual:
                     os.rename(statusDir + '/' + statusFile, statusDir + '/' + jobName + '.' + actual)
 
-                
+
+class QueuedServer(DAServer):
+    """
+    Base class for servers using fixed- or indefinite-depth queue of requests.
+    Derived class must define a static member MAXDEPTH.
+    """
+
+    def __init__(self, name_):
+        DAServer.__init__(self, name_)
+        
+        self._queue = Queue.Queue(self.__class__.MAXDEPTH)
+        self._lock = threading.Lock()
+        
+    def canServe(self, jobName_):
+        if not self._queue.full(): return 1
+        else: return 0
+
+    def serve(self, request_, jobName_):
+        self._queue.put(request_)
+        if DEBUG: self.log('Queued job', jobName_)
+
+        with self._lock:
+            while True:
+                try:
+                    request = self._queue.get(block = False) # will raise Queue.Empty exception when empty
+                    self._serveOne(request, jobName_)
+                except Queue.Empty:
+                    break
+                except:
+                    self.log('Communication with ' + jobName_ + ' failed: ' + str(sys.exc_info()[0:2]))
+                    break
+
+
+class ReduceServer(DAServer):
+    """
+    DAServer interface to reducer
+    """
+
+    def __init__(self, name_, reducer_):
+        DAServer.__init__(self, name_)
+        self._reducer = reducer_
+        self._reducer.setLogFunc(self.log)
+
+    def canServe(self, jobName_):
+        return 1
+
+    def serve(self, request_, jobName_):
+        try:
+            request_.recv(1024)
+            request_.send(self._reducer.workdir + '/input')
+            response = request_.recv(1024)
+            self.log('Job', jobName_, ':', response)
+            if response == 'FAIL':
+                raise RuntimeError('Copy failed')
+        except:
+            self.log('Job', jobName_, 'Reducer exception', sys.exc_info()[0:2])
+            try:
+                request_.send('FAILED')
+            except:
+                # should have a way to kill the job
+                pass
+            return
+
+        request_.send('OK')
+        if DEBUG: self.log('Adding', reponse, 'to reducer queue')
+        self._reducer.inputQueue.put(response)
+
+        self._reducer.reduce()
+
+
 class DownloadRequestServer(QueuedServer):
     """
     Service for download traffic control. Serializes multiple requests to a single resource (disk).
@@ -546,7 +657,7 @@ class DownloadRequestServer(QueuedServer):
             response = request_.recv(1024)
             request_.send('OK')
             if response == 'DONE': break
-        
+
 
 class DSCPServer(QueuedServer):
     """
@@ -635,12 +746,11 @@ if __name__ == '__main__':
     parser.add_option_group(inputOpts)
 
     runtimeOpts  =  OptionGroup(parser, "Runtime options", "These options can be changed for each job submission.")
-    runtimeOpts.add_option('-c', '--client', dest = 'client', help = "Client to use for processing. Options are bsub (lxbatch), lxplus, and local.", default = 'bsub', metavar = "MODE")
+    runtimeOpts.add_option('-c', '--cluster', dest = 'cluster', help = "Cluster to use for processing. Options are lsf, interactive, and local.", default = 'lsf', metavar = "MODE")
     runtimeOpts.add_option("-b", "--bsub-options", dest = "bsubOptions", help = 'Options to pass to bsub command. -J and -cwd are set automatically. Example: -R "rusage[pool = 2048]" -q 8nh', metavar = "OPTIONS", default = "-q 8nh")
     runtimeOpts.add_option("-D", "--debug", action = "store_true", dest = "debug", help = "")
     runtimeOpts.add_option("-r", "--resubmit", action = "store_true", dest = "resubmit", help = "Resubmit the job")
     runtimeOpts.add_option("-R", "--recover", action = "store_true", dest = "recover", help = "Recover failed jobs")
-    runtimeOpts.add_option("-P", "--max-parallel", dest = "maxParallel", help = "Maximum (approximate) number of parallel jobs to run.", type = "int", default = 25, metavar = "NUM")
     runtimeOpts.add_option("-j", "--jobs", dest = "jobs", help = "Jobs to submit.", default = "", metavar = "JOB1[,JOB2[,JOB3...]]")
     runtimeOpts.add_option("-M", "--max-jobs", dest = "maxJobs", help = "Maximum number of jobs to submit.", type = "int", default = -1, metavar = "NUM")
     runtimeOpts.add_option("-S", "--auto-resubmit", action = "store_true", dest = "autoResubmit", help = "Automatically resubmit failed jobs")
@@ -649,8 +759,8 @@ if __name__ == '__main__':
 
     (options, args) = parser.parse_args()
 
-    if options.client not in ['bsub', 'lxplus', 'local']:
-        raise RuntimeError('Client ' + options.client + ' not supported')
+    if options.cluster not in DADispatcher.CLUSTERS:
+        raise RuntimeError('Cluster ' + options.cluster + ' not supported')
 
     sys.argv = sys.argv[0:1]
 
@@ -664,15 +774,15 @@ if __name__ == '__main__':
 
     ### CREATE SERVER ###
 
-    jobKey = string.join(random.sample(string.ascii_lowercase, 4), '')
+    taskID = string.join(random.sample(string.ascii_lowercase, 4), '')
 
-    tcpServer = DelegatingTCPServer(jobKey)
+    tcpServer = DelegatingTCPServer()
 
     ### OPEN TERMINAL ###
 
     if DEBUG: print "opening terminal"
 
-    terminal = Terminal(TERMNODE)
+    terminal = Terminal(TERMNODE, verbose = True)
 
     ### CONFIGURATION ###
 
@@ -751,11 +861,11 @@ if __name__ == '__main__':
 
     ### RUNTIME-SPECIFIC CONFIGURATIONS ###
 
-    jobConfig['key'] = jobKey
+    jobConfig['taskID'] = taskID
     jobConfig['serverHost'] = os.environ['HOSTNAME']
     jobConfig['serverPort'] = tcpServer.server_address[1]
-    jobConfig['serverWorkDir'] = TMPDIR + '/' + jobKey
-    jobConfig["logDir"] = HTMLDIR + '/' + jobKey + '/logs'
+    jobConfig['serverWorkDir'] = TMPDIR + '/' + taskID
+    jobConfig["logDir"] = HTMLDIR + '/' + taskID + '/logs'
     # In principle log directory can be anywhere; we are choosing it to be directly in the HTMLDIR for convenience
 
     ### SAVE JOB CONFIGURATION ###
@@ -763,7 +873,7 @@ if __name__ == '__main__':
     with open(workspace + '/jobconfig.py', 'w') as configFile:
         configFile.write('jobConfig = ' + str(jobConfig))
 
-    tmpWorkspace = TMPDIR + '/' + jobKey
+    tmpWorkspace = TMPDIR + '/' + taskID
     os.mkdir(tmpWorkspace)
 
     ### LOG DIRECTORY ###
@@ -921,12 +1031,16 @@ if __name__ == '__main__':
                         configFile.write('getattr(ROOT, "' + arg + '"), ')
 
             configFile.write(')\n')
+
+    # lock file
+    os.chmod(jobConfig['macro'], 0444)
     
     terminal.communicate('cd ' + workspace + ';source environment;python macro.py > logs/compile.log 2>&1')
 
     with open(workspace + '/logs/compile.log', 'r') as logFile:
         for line in logFile:
             if 'Error' in line or 'fail' in line:
+                os.chmod(jobConfig['macro'], 0644)
                 raise RuntimeError("Compilation failed")
 
     ### SERVICES ###
@@ -946,10 +1060,12 @@ if __name__ == '__main__':
 
         os.mkdir(tmpWorkspace + '/reduce')
 
-        reducer = eval(jobConfig['reducer'])('reduce', jobConfig['outputFile'], maxSize = jobConfig['maxSize'], workdir = tmpWorkspace + '/reduce')
-        reducer.setLog(tcpServer.log)
-        # tcpServer.addService(reducer)
-        # Choosing to run reducer "offline" and not as a service; adds stability with a price of little time rag after the jobs are done. darun jobs will upload the output to $TMPDIR/{key}/reduce
+        reducer = eval(jobConfig['reducer'])(jobConfig['outputFile'], maxSize = jobConfig['maxSize'], workdir = tmpWorkspace + '/reduce')
+        # reduceServer = ReduceServer('reduce', reducer)
+        # reduceServer.setLog(tcpServer.log)
+        # tcpServer.addService(reduceServer)
+        # Choosing to run reducer "offline" and not as a service; adds stability with a price of little time rag after the jobs are done. darun jobs will upload the output to $TMPDIR/{taskID}/reduce
+        reducer.setLog(lambda *args : tcpServer.log(string.join(map(str, args)), name = 'reducer'))
 
     if jobConfig['outputNode'] == os.environ['HOSTNAME'] and jobConfig['outputDir'][0:7] == '/store/':
         # The output is an LFN on this storage element.
@@ -958,11 +1074,12 @@ if __name__ == '__main__':
         tcpServer.addService(DSCPServer('dscp', jobConfig['outputDir'], workdir = tmpWorkspace + '/dscp'))
 
     # dispatcher
-    dispatcher = DADispatcher(workspace, options.client, resubmit = options.autoResubmit, terminal = terminal)
-    dispatcher.setWebDir(HTMLDIR + '/' + jobKey)
+    dispatcher = DADispatcher(workspace, resubmit = options.autoResubmit, terminal = terminal)
+    dispatcher.setWebDir(HTMLDIR + '/' + taskID)
+    dispatcher.options['lsf'] = options.bsubOptions
 
     for jobName in allJobs:
-        dispatcher.createJob(jobName)
+        dispatcher.createJob(jobName, options.cluster)
 
     tcpServer.addService(dispatcher)
 
@@ -989,7 +1106,7 @@ if __name__ == '__main__':
     print 'Start job submission'
 
     try:
-        dispatcher.dispatch(options.maxParallel, bsubOptions = options.bsubOptions, logdir = jobConfig['logDir'])
+        dispatcher.dispatch(logdir = jobConfig['logDir'])
     except KeyboardInterrupt:
         pass
 
@@ -1022,8 +1139,10 @@ if __name__ == '__main__':
         if reducer.copyOutputTo(dest):
             if len(reducer.succeeded) != len(allJobs):
                 print 'Number of input files to reducer does not match the number of jobs: {0}/{1}'.format(len(reducer.succeeded), len(allJobs))
+                completed = False
             elif len(reducer.failed):
                 print 'Final reduction failed. Output in', reducer.workdir
+                completed = False
             else:
                 reducer.cleanup()
         else:
@@ -1041,7 +1160,18 @@ if __name__ == '__main__':
     tcpServer.stop()
     
     terminal.close()
+
+    if not completed:
+        response = ''
+        while response != 'Y' and response != 'n':
+            print 'Clean workdir (' + tmpWorkspace + ')? [Y/n] (n):'
+            response = sys.stdin.readline().strip()
+            if not response: response = 'n'
+
+        if response == 'Y': completed = True
             
     if completed: shutil.rmtree(tmpWorkspace, ignore_errors = True)
+
+    os.chmod(jobConfig['macro'], 0644)
 
     print 'Done.'

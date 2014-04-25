@@ -1,3 +1,7 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+
 import os
 import sys
 import random
@@ -13,10 +17,9 @@ srcdir = os.path.dirname(os.path.realpath(__file__))
 if srcdir not in sys.path:
     sys.path.append(srcdir)
 from globals import *
-from daserver import DAServer
 from dscp import dscp
 
-class Reducer(DAServer):
+class Reducer(object):
     """
     Base class for reducer servers.
     Protocol:
@@ -24,8 +27,8 @@ class Reducer(DAServer):
       CLT: scp to target directory, send file name
     """
 
-    def __init__(self, name_, targetFileName_, maxSize = 0, workdir = ''):
-        DAServer.__init__(self, name_)
+    def __init__(self, targetFileName_, maxSize = 0, workdir = '', log = print):
+        self._logFunc = log
         
         self._targetFileBase = targetFileName_[0:targetFileName_.rfind('.')]
         self._targetFileSuffix = targetFileName_[targetFileName_.rfind('.'):]
@@ -51,53 +54,44 @@ class Reducer(DAServer):
             if not os.path.isdir(self.workdir + '/input'):
                 raise RuntimeError("Reducer input directory")
         
-        if DEBUG: self.log('Working directory', self.workdir)
+        if DEBUG: self._logFunc('Working directory', self.workdir)
         
         self.succeeded = []
         self.failed = []
 
-    def canServe(self, jobName_):
-        return 1
-
-    def serve(self, request_, jobName_):
-        try:
-            request_.recv(1024)
-            request_.send(self.workdir + '/input')
-            response = request_.recv(1024)
-            self.log('Job', jobName_, ':', response)
-            if response == 'FAIL':
-                raise RuntimeError('Copy failed')
-        except:
-            self.log('Job', jobName_, 'Reducer exception', sys.exc_info()[0:2])
-            try:
-                request_.send('FAILED')
-            except:
-                # should have a way to kill the job
-                pass
-            return
-
-        request_.send('OK')
-        if DEBUG: self.log('Adding', reponse, 'to reducer queue')
-        self.inputQueue.put(response)
-
-        self.reduce()
+    def setLog(self, logFunc_):
+        self._logFunc = logFunc_
 
     def reduce(self):
         pass
 
     def finalize(self):
+        remaining = []
+        while True:
+            try:
+                remaining.append(self.inputQueue.get(block = False))
+            except Queue.Empty:
+                break
+
+        if len(remaining) != 0:
+            for entry in remaining:
+                self.inputQueue.put(entry)
+
+            total = len(self.succeeded) + len(self.failed) + len(remaining)
+            while len(self.succeeded) + len(self.failed) != total:
+                self.reduce()
+        
         if self._outputNumber == 0:
             try:
-                self.log('mv', self.workdir + '/' + self._targetFileBase + '_0' + self._targetFileSuffix, self.workdir + '/' + self._targetFileBase + self._targetFileSuffix)
+                self._logFunc('mv', self.workdir + '/' + self._targetFileBase + '_0' + self._targetFileSuffix, self.workdir + '/' + self._targetFileBase + self._targetFileSuffix)
                 os.rename(self.workdir + '/' + self._targetFileBase + '_0' + self._targetFileSuffix,
                           self.workdir + '/' + self._targetFileBase + self._targetFileSuffix)
             except:
-                self.log('Exception in renaming ouput:', sys.exc_info()[0:2])
+                self._logFunc('Exception in renaming ouput:', sys.exc_info()[0:2])
                 pass
 
     def copyOutputTo(self, destination_):
-        if DEBUG: print 'Copying output to', destination_
-        self.log('Copying output to', destination_)
+        self._logFunc('Copying output to', destination_)
         if ':' in destination_:
             for outputFile in glob.glob(self.workdir + '/' + self._targetFileBase + '*' + self._targetFileSuffix):
                 proc = subprocess.Popen(['scp', '-oStrictHostKeyChecking=no', '-oLogLevel=quiet', outputFile, destination_],
@@ -111,7 +105,7 @@ class Reducer(DAServer):
                     while True:
                         line = proc.stdout.readline().strip()
                         if not line: break
-                        self.log(line)
+                        self._logFunc(line)
 
                     return False
             
@@ -144,7 +138,7 @@ class Hadder(Reducer):
 
     ROOT = None
 
-    def __init__(self, name_, targetFileName_, maxSize = 0, workdir = ''):
+    def __init__(self, targetFileName_, maxSize = 0, workdir = '', log = print):
         if Hadder.ROOT is None:
             argv = sys.argv
             sys.argv = ['', '-b']
@@ -153,7 +147,7 @@ class Hadder(Reducer):
             Hadder.ROOT.gSystem.Load("libTreePlayer.so")
             sys.argv = argv # sys.argv is read when a first call to ROOT object is made
         
-        Reducer.__init__(self, name_, targetFileName_, maxSize, workdir)
+        Reducer.__init__(self, targetFileName_, maxSize, workdir)
 
         self._lock = threading.Lock()
 
@@ -163,17 +157,17 @@ class Hadder(Reducer):
             merger = Hadder.ROOT.TFileMerger(False, False)
         
             if not merger.OutputFile(tmpOutputPath):
-                self.log('Cannot open temporary output', tmpOutputPath)
+                self._logFunc('Cannot open temporary output', tmpOutputPath)
                 return
    
             outputPath = self.workdir + '/' + self._targetFileBase + '_' + str(self._outputNumber) + self._targetFileSuffix
         
             if os.path.exists(outputPath):
                 if not merger.AddFile(outputPath):
-                    self.log('Cannot append to', outputPath)
+                    self._logFunc('Cannot append to', outputPath)
                     return
 
-                self.log('Appending to', outputPath)
+                self._logFunc('Appending to', outputPath)
 
             totalSize = 0
             toAdd = []
@@ -181,7 +175,7 @@ class Hadder(Reducer):
                 try:
                     inputPath = self.workdir + '/input/' + self.inputQueue.get(block = False) # will raise Queue.Empty exception when empty
                     if not merger.AddFile(inputPath):
-                        self.log('Cannot add', inputPath, 'to list')
+                        self._logFunc('Cannot add', inputPath, 'to list')
                         self.failed.append(inputPath)
                         continue
                     
@@ -193,15 +187,18 @@ class Hadder(Reducer):
                     # loop over inputPaths reached the end -> no need to increment outputNumber
                     self._outputNumber -= 1
                     break
+                except:
+                    self.failed.append(inputPath)
+                    raise
 
-            self.log('hadd', tmpOutputPath, string.join(toAdd))
+            self._logFunc('hadd', tmpOutputPath, string.join(toAdd))
 
             if merger.Merge():
-                self.log('mv', tmpOutputPath, outputPath)
+                self._logFunc('mv', tmpOutputPath, outputPath)
                 os.rename(tmpOutputPath, outputPath)
                 self.succeeded += toAdd
             else:
-                self.log('Merge failed')
+                self._logFunc('Merge failed')
                 self.failed += toAdd
     
             self._outputNumber += 1
@@ -212,14 +209,14 @@ class HEfficiencyAdder(Hadder):
     Hadder with efficiency calculation.
     """
 
-    def __init__(self, name_, targetFileName_, maxSize = 0, workdir = ''):
-        Hadder.__init__(self, name_, targetFileName_, maxSize, workdir)
+    def __init__(self, targetFileName_, maxSize = 0, workdir = '', log = print):
+        Hadder.__init__(self, targetFileName_, maxSize, workdir)
 
     def finalize(self):
-        if self._outputNumber != 0:
-            self.log('Output seems to be a tree file. Will not calculate efficiency.')
-
         Reducer.finalize(self)
+
+        if self._outputNumber != 0:
+            self._logFunc('Output seems to be a tree file. Will not calculate efficiency.')
 
         file = Hadder.ROOT.TFile(self.workdir + '/' + self._targetFileBase + self._targetFileSuffix, "update")
         for key in file.GetListOfKeys():
@@ -240,7 +237,7 @@ class HEfficiencyAdder(Hadder):
 if __name__ == '__main__':
 
     if len(sys.argv) < 3:
-        print 'Usage: python reducer.py REDUCER WORKDIR [MAXSIZE]'
+        print('Usage: python reducer.py REDUCER WORKDIR [MAXSIZE]')
         sys.exit(1)
 
     workdir = sys.argv[2]
@@ -254,7 +251,7 @@ if __name__ == '__main__':
     sys.stdout.flush()
     targetFileName = sys.stdin.readline().strip()
 
-    reducer = eval(sys.argv[1])('reducer', targetFileName, maxSize, workdir)
+    reducer = eval(sys.argv[1])(targetFileName, maxSize, workdir)
 
     for file in os.listdir(workdir + '/input'):
         reducer.inputQueue.put(file)
