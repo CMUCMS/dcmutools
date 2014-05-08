@@ -1,0 +1,31 @@
+#!/bin/bash
+
+LOG=/var/log/downloadd.log
+
+if [ "$1" = "-1" ]; do
+    LINEAR="-L"
+    shift
+done
+
+i=0
+while [ $# -ne 0 ]; do
+    src[$i]=$1
+    dest[$i]=$2
+    echo ${src[$i]}" -> "${dest[$i]}
+    i=$(($i+1))
+    shift
+    shift
+done
+
+echo $(date) > $LOG
+
+while true; do
+    n=0
+    i=0
+    while [ $i -lt ${#src[@]} ]; do
+        dsDownload.py $LINEAR -d ${src[$i]} ${dest[$i]} >> $LOG && n=$(($n+1))
+        i=$(($i+1))
+    done
+
+    [ $n -eq 0 ] && sleep 120
+done

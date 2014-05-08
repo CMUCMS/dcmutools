@@ -7,12 +7,10 @@ import re
 import subprocess
 import random
 
-disks = []
-with open('/proc/mounts') as mounts:
-    for mount in mounts:
-        matches = re.match('/dev/sd[b-z][0-9]+ ([^ ]+)', mount)
-        if not matches: continue
-        disks.append(matches.group(1))
+srcdir = os.path.dirname(os.path.realpath(__file__))
+if srcdir not in sys.path:
+    sys.path.append(srcdir)
+from disks import disks
 
 def dscp(source, lfn, logfunc):
     if os.path.islink(lfn):

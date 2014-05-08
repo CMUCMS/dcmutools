@@ -7,72 +7,190 @@ import re
 import os
 import sys
 
-path = sys.argv[1]
+srcdir = os.path.dirname(os.path.realpath(__file__))
+if srcdir not in sys.path:
+    sys.path.append(srcdir)
+from dsrm import rmlink
 
-files = os.listdir(path)
+def check_dataset(path, names, exclude = [], removeEmpty = False):
 
-eventsPat = re.compile(r'susyEvents_(([0-9]+)_[0-9]+_[a-zA-Z0-9]{3})')
-triggersPat = re.compile(r'susyTriggers_(([0-9]+)_[0-9]+_[a-zA-Z0-9]{3})')
-
-events = []
-triggers = []
-
-for file in files:
-    eventsMatch = eventsPat.match(file)
-    if eventsMatch:
-        events.append((int(eventsMatch.group(2)), eventsMatch.group(1)))
-        continue
-
-    triggersMatch = triggersPat.match(file)
-    if triggersMatch:
-        triggers.append((int(triggersMatch.group(2)), triggersMatch.group(1)))
-        continue
-
-matchTriggers = False
-if len(triggers) != 0:
-    matchTriggers = True
-
-events.sort()
-triggers.sort()
-
-currentJobNum = 0
-jobStack = []
-for e in events:
-    iJob = e[0]
-    jobId = e[1]
+    patterns = []
+    for name in names:
+        patterns.append(re.compile(name[0:name.rfind('.')] + '_(([0-9]+)_[0-9]+_[a-zA-Z0-9]{3})[.]' + name[name.rfind('.') + 1:]))
     
-    if iJob == currentJobNum:
-        jobStack.append(jobId)
-    else:
-        if len(jobStack) > 1:
-            message = "Duplicated event files "
-            for d in jobStack:
-                message += d + ' '
-            
-            print message
-
-        while iJob > currentJobNum + 1:
-            print "Skipped event file " + str(currentJobNum + 1)
-            currentJobNum += 1
-
-        currentJobNum += 1
-
-        jobStack = [jobId]
-
-    if matchTriggers and e not in triggers:
-        print "Missing trigger file " + jobId
-
-if len(jobStack) > 1:
-    message = "Duplicated event files "
-    for d in jobStack:
-        message += d + ' '
+    lists = {} # {jobNumber: {suffix-1: [pat1exists, pat2exists, ..], suffix-2: [pat1exists, pat2exists, ..]}}
         
-    print message
+    for file in os.listdir(path):
+        for iP in range(len(patterns)):
+            pattern = patterns[iP]
+            matches = pattern.match(file)
+            if not matches: continue
 
-print "Last event file num " + str(currentJobNum)
+            jobNumber = int(matches.group(2))
 
-if matchTriggers:
-    for t in triggers:
-        if t not in events:
-            print "Orphan trigger file " + t[1]
+            if jobNumber in exclude:
+                break
+
+            if removeEmpty:
+                pfn = os.readlink(path + '/' + file)
+                try:
+                    size = os.stat(pfn).st_size
+                except OSError:
+                    size = 0
+
+                if size == 0:
+                    print 'dsrm', path + '/' + file
+                    rmlink(path + '/' + file)
+                    break
+            
+            if jobNumber not in lists:
+                lists[jobNumber] = {}
+
+            suffix = matches.group(1)
+            if suffix not in lists[jobNumber]:
+                lists[jobNumber][suffix] = [False] * len(patterns)
+
+            lists[jobNumber][suffix][iP] = True
+
+            break
+        
+        else:
+            print 'File', file, 'does not match any given patterns'
+
+    incompletes = [] # list of suffices
+    duplicates = [] # list of list of suffices
+    
+    for jobNumber, combinations in lists.items():
+        for suffix, existenceList in combinations.items():
+            if not reduce(lambda x, y: x and y, existenceList):
+                incompletes.append(suffix)
+
+        if len(combinations) > 1:
+            duplicates.append(combinations.keys())
+
+    absents = sorted(set(range(1, max(lists.keys()) + 1)) - set(lists.keys()))
+
+    return incompletes, duplicates, absents
+
+if __name__ == '__main__':
+
+    from optparse import OptionParser
+
+    parser = OptionParser()
+    parser.add_option('-x', '--exclude', dest = 'exclude', help = 'Jobs to exclude (comma separated, no spaces)', default = '')
+    parser.add_option('-e', '--remove-empty', action = 'store_true', dest = 'removeEmpty', help = 'Remove empty files')
+    parser.add_option('-p', '--patterns', dest = 'patterns', help = 'File names to match (comma separated, no spaces)', default = 'susyEvents.root')
+    
+    options, args = parser.parse_args()
+
+    path = args[0]
+
+    patterns = options.patterns.split(',')
+
+    print 'Checking', path, 'for patterns', options.patterns.split(',')
+
+    if options.exclude.strip():
+        exclude = map(int, options.exclude.split(','))
+    else:
+        exclude = []
+
+    incompletes, duplicates, absents = check_dataset(path, patterns, exclude, options.removeEmpty)
+
+    allFiles = os.listdir(path)
+
+    if len(incompletes):
+        while True:
+            print '(R)emove incomplete file sets / (s)kip?'
+            response = sys.stdin.readline().strip()
+            if response == 'R' or response == 's': break
+
+        if response == 'R':
+            while True:
+                try:
+                    suffix = incompletes.pop()
+                except IndexError:
+                    break
+
+                for file in filter(lambda s: suffix in s, allFiles):
+                    print 'dsrm', path + '/' + file
+                    rmlink(path + '/' + file)
+
+                resolved = []
+                for iD in range(len(duplicates)):
+                    if suffix in duplicates[iD]:
+                        duplicates[iD].remove(suffix)
+                        if len(duplicates[iD]) < 2:
+                            resolved.append(duplicates[iD])
+
+                for suffices in resolved:
+                    duplicates.remove(suffices)
+
+
+    if len(duplicates):
+        while True:
+            print '(R)emove duplicates individually / remove (All) duplicates / (s)kip / (l)ist?'
+            response = sys.stdin.readline().strip()
+            if response == 'R' or response == 'All' or response == 's' or response == 'l':
+                break
+
+        if response == 'R' or response == 'l':
+            resolved = []
+            for iD in range(len(duplicates)):
+                suffices = duplicates[iD]
+                print '============================='
+                files = {}
+                for iS in range(len(suffices)):
+                    files[iS] = []
+                    print '<' + str(iS) + '>'
+                    for file in sorted(filter(lambda s: suffices[iS] in s, allFiles)):
+                        lfn = path + '/' + file
+                        pfn = os.readlink(lfn)
+                        print (' %10d' % os.stat(pfn).st_size), file
+                        files[iS].append(lfn)
+
+                if response == 'R':
+                    print 'Remove (space separated):'
+                    indices = sys.stdin.readline().strip().split()
+    
+                    for index in indices:
+                        try:
+                            lfns = files[index]
+                        except KeyError:
+                            continue
+    
+                        for lfn in lfns:
+                            print 'dsrm', lfn
+                            rmlink(lfn)
+
+                        suffices.pop(index)
+
+                    if len(suffices) < 2:
+                        resolved.append(suffices)
+
+                for suffices in resolved:
+                    duplicates.remove(suffices)
+
+        elif response == 'All':
+            for suffices in duplicates:
+                suffices.pop(0)
+                for suffix in suffices:
+                    for file in filter(lambda s: suffix in s, allFiles):
+                        print 'dsrm', path + '/' + file
+                        rmlink(path + '/' + file)
+
+            duplicates = []
+
+    if len(absents):
+        print 'Missing jobs'
+        print ','.join(map(str, absents))
+
+    if len(incompletes):
+        print 'Incomplete file sets'
+        for suffix in incompletes:
+            print ' ', suffix
+
+    if len(duplicates):
+        print 'Duplicates'
+        for suffices in duplicates:
+            print ' ', suffices
 
