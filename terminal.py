@@ -14,8 +14,8 @@ class Terminal:
     A wrapper for an ssh session.
     """
 
-    def __init__(self, servName_, verbose = False):
-        self._servName = servName_
+    def __init__(self, remoteName_, verbose = False):
+        self._remoteName = remoteName_
         self._session = None
         self._verbose = verbose
         self.node = ''
@@ -27,7 +27,7 @@ class Terminal:
     def open(self):
         if self.isOpen(): return
         
-        self._session = subprocess.Popen(['ssh', '-oStrictHostKeyChecking=no', '-oLogLevel=quiet', '-T', self._servName],
+        self._session = subprocess.Popen(['ssh', '-oStrictHostKeyChecking=no', '-oLogLevel=quiet', '-T', self._remoteName],
             stdin = subprocess.PIPE,
             stdout = subprocess.PIPE,
             stderr = subprocess.STDOUT,
@@ -50,6 +50,11 @@ class Terminal:
 
             if self._session.poll() is None:
                 self._session.terminate()
+
+            stdout, stderr = self._session.communicate()
+            if self._verbose:
+                if stdout: print 'STDOUT', stdout
+                if stderr: print 'STDERR', stderr
                 
             self.node = ''
         except OSError:

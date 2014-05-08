@@ -55,6 +55,9 @@ class ServerConnection(object):
     jobName = ''
     host = ''
     port = 0
+
+    class ConnectionRejected(Exception):
+        pass
     
     def __init__(self, service_):
         nAttempt = 0
@@ -66,17 +69,13 @@ class ServerConnection(object):
                 self.sock.connect((ServerConnection.host, ServerConnection.port))
 
                 if DEBUG: log(ServerConnection.jobName + ' ' + ServerConnection.key)
-                self.sock.send(ServerConnection.jobName + ' ' + ServerConnection.key)
-                
-                response = self.sock.recv(1024)
+                response = self.communicate(ServerConnection.jobName + ' ' + ServerConnection.key)
                 if DEBUG: log(ServerConnection.host + ' says ' + response)
                 if response != 'SVC':
                     raise Exception()
                 
                 if DEBUG: log(service_)
-                self.sock.send(service_)
-                
-                response = self.sock.recv(1024)
+                response = self.communicate(service_)
                 if DEBUG: log(ServerConnection.host + ' says ' + response)
                 if response == 'ACCEPT':
                     break
@@ -111,6 +110,15 @@ class ServerConnection(object):
             self.sock.close()
         except:
             pass
+
+    def communicate(self, message, listen = True):
+        self.sock.send(message)
+        if listen:
+            response = self.sock.recv(1024)
+            if response == 'REJECT':
+                raise ServerConnection.ConnectionRejected
+            
+            return response
     
     
 def downloadFiles(workspace_, jobName_, taskID_, host_, queue_):
@@ -137,8 +145,7 @@ def downloadFiles(workspace_, jobName_, taskID_, host_, queue_):
     
             try:
                 if DEBUG: log('DLD')
-                conn.sock.send('DLD')
-                response = conn.sock.recv(1024)
+                response = conn.communicate('DLD')
                 if DEBUG: log(ServerConnection.host + ' says ' + response)
 
                 if response != 'OK':
@@ -167,13 +174,15 @@ def downloadFiles(workspace_, jobName_, taskID_, host_, queue_):
                         pass
 
                 if DEBUG: log('DONE')
-                conn.sock.send('DONE')
+                conn.communicate('DONE', listen = False)
     
                 localPaths.append(localPath)
 
             except:
                 log('download request failed in', jobName_, 'due to', sys.exc_info()[0:2], '. retrying')
                 break
+            finally:
+                conn = None
         else:
             # copied all files in this line
             log('successfully downloaded', localPaths)
@@ -192,8 +201,7 @@ def heartbeat():
     while True:
         conn = ServerConnection('dispatch')
         if conn.sock:
-            conn.sock.send('HB')
-            conn.sock.recv(1024)
+            conn.communicate('HB')
             conn = None
 
         time.sleep(60)
@@ -215,7 +223,7 @@ if __name__ == '__main__':
     sys.stdout = logFile
     sys.stderr = logFile
 
-    log('loading config')
+    log('darun.py', workspace, jobName, key)
 
     from macro import arguments # worker source code loaded to ROOT here
 
@@ -228,8 +236,7 @@ if __name__ == '__main__':
 
     conn = ServerConnection('dispatch')
     if DEBUG: log('RUNNING')
-    conn.sock.send('RUNNING')
-    conn.sock.recv(1024)
+    conn.communicate('RUNNING')
     conn = None # delete the object to close the connection
         
     outputDir = TMPDIR + '/' + jobConfig['taskID'] + '/output/' + jobName
@@ -341,8 +348,7 @@ if __name__ == '__main__':
   
 #            conn = ServerConnection('reduce')
 #            if DEBUG: log('DEST')
-#            conn.sock.send('DEST')
-#            response = conn.sock.recv(1024)
+#            response = conn.communicate('DEST')
 #            if DEBUG: log(ServerConnection.host + ' says ' + response)
 #            remotePath = response + '/' + remoteFileName
 # Choosing to run reducer "offline" and not as a service; adds stability with a price of little time rag after the jobs are done. darun jobs will upload the output to $TMPDIR/{taskID}
@@ -404,18 +410,16 @@ if __name__ == '__main__':
                         log('dscp', remotePath)
                         
                         if DEBUG: log(remotePath)
-                        dscp.sock.send(remotePath)
-                        response = dscp.sock.recv(1024)
+                        response = dscp.communicate(remotePath)
                         if DEBUG: log(ServerConnection.host + ' says ' + response)
-                        if response == 'FAILED':
+                        if response != 'OK':
                             raise RuntimeError('DSCP failed')
                         
                     break
                 else:
                     log(command, 'failed')
 
-#                    conn.sock.send('FAIL')
-#                    conn.sock.recv(1024)
+#                    conn.communicate('FAIL')
 #                    conn = None
 
                 iTry += 1
@@ -423,15 +427,14 @@ if __name__ == '__main__':
                 raise RuntimeError('copy failure')
 
         if dscp:
-            dscp.sock.send('DONE')
+            dscp.communicate('DONE', listen = False)
             dscp = None        
 
         # report to dispatcher
         
         conn = ServerConnection('dispatch')
         if DEBUG: log('DONE')
-        conn.sock.send('DONE')
-        conn.sock.recv(1024)
+        conn.communicate('DONE')
         conn = None
 
         log('Done.')
@@ -445,8 +448,7 @@ if __name__ == '__main__':
         conn = ServerConnection('dispatch')
         if DEBUG: log('FAILED')
         if conn.sock:
-            conn.sock.send('FAILED')
-            conn.sock.recv(1024)
+            conn.communicate('FAILED')
         conn = None
         
         log('Aborted.')

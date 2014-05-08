@@ -97,7 +97,12 @@ class DelegatingTCPServer(SocketServer.ThreadingTCPServer):
             else:
                 raise RuntimeError(serviceName + ' cannot serve ' + jobName)
         except:
-            self.log('Process request exception ' + str(sys.exc_info()[0:2]))
+            try:
+                clientHost = socket.gethostbyaddr(clientAddr_[0])[0]
+            except:
+                clientHost = 'unknown'
+                
+            self.log('Exception processing request from ' + clientHost + ': ' + str(sys.exc_info()[0:2]))
             try:
                 request_.send('REJECT')
             except:
@@ -105,7 +110,11 @@ class DelegatingTCPServer(SocketServer.ThreadingTCPServer):
                 pass
 
         # let the client close the connection first; frees up server from having to stay in TIME_WAIT
-        request_.recv(1024)
+        try:
+            request_.recv(1024)
+        except:
+            pass
+        
         self.close_request(request_)
         self.log('Closed request from ' + jobName + ' for ' + serviceName)
 
@@ -195,7 +204,7 @@ class DADispatcher(DAServer):
 
     CLUSTERS = ['lsf', 'interactive', 'local']
     FALLBACK = {'lsf': 'interactive', 'interactive': '', 'local': ''}
-    MAXACTIVE = {'lsf': 40, 'interactive': 20, 'local': 20}
+    MAXACTIVE = {'lsf': 40, 'interactive': 10, 'local': 20}
 
     class JobInfo(object):
         """
@@ -222,7 +231,7 @@ class DADispatcher(DAServer):
         self._readyJobs = dict([(k, []) for k in DADispatcher.CLUSTERS])
         self._activeJobs = dict([(k, []) for k in DADispatcher.CLUSTERS])
         self._lock = threading.Lock()
-        self._update = threading.Event()
+        self._stateChanged = threading.Event()
         if terminal:
             self._terminal = terminal
         else:
@@ -264,13 +273,25 @@ class DADispatcher(DAServer):
         with self._lock:
             try:
                 jobInfo.state = response
-    
+
+                finished = False
+                
                 if jobInfo.state == 'DONE':
                     self._activeJobs[jobInfo.cluster].remove(jobInfo)
+                    finished = True
                 elif jobInfo.state == 'FAILED':
                     self._activeJobs[jobInfo.cluster].remove(jobInfo)
                     if self._resubmit:
                         self._readyJobs[jobInfo.cluster].append(jobInfo)
+
+                    finished = True
+
+                if finished:
+                    if jobInfo.cluster == 'interactive':
+                        jobInfo.proc.close()
+                    elif jobInfo.cluster == 'local':
+                        jobInfo.proc.communicate()
+
             except:
                 self.log('Exception while serving', jobName_, sys.exc_info()[0:2])
 
@@ -278,33 +299,39 @@ class DADispatcher(DAServer):
             with open(self._workspace + '/logs/' + jobName_ + '.fail', 'w') as failLog:
                 pass
 
-        self._update.set()
+        self._stateChanged.set()
         
-    def createJob(self, jobName_, cluster_):
+    def createJob(self, jobName_, cluster_, append = True):
         jobInfo = DADispatcher.JobInfo(jobName_)
         jobInfo.cluster = cluster_
         self._jobInfo[jobName_] = jobInfo
-        self._readyJobs[cluster_].append(jobInfo)
+        if append: self._readyJobs[cluster_].append(jobInfo)
         if DEBUG: self.log('Created', jobName_)
+        return jobInfo
 
     def submitOne(self, cluster, logdir = ''):
         if len(self._activeJobs[cluster]) >= DADispatcher.MAXACTIVE[cluster] or \
            len(self._readyJobs[cluster]) == 0:
             return False
 
-        jobInfo = self._readyJobs[cluster][0]
-        if DEBUG: self.log('submit', jobInfo.name)
-        return self.submit(jobInfo, logdir)
-
-    def submit(self, jobInfo_, logdir = ''):
         with self._lock:
             try:
-                self._readyJobs[jobInfo_.cluster].remove(jobInfo_)
-            except ValueError:
+                jobInfo = self._readyJobs[cluster].pop(0)
+            except IndexError:
                 return False
-                
-            self._activeJobs[jobInfo_.cluster].append(jobInfo_)
-        
+       
+        if DEBUG: self.log('submit', jobInfo.name)
+
+        if self.submit(jobInfo, logdir):
+            with self._lock:
+                self._activeJobs[cluster].append(jobInfo)
+            return True
+        else:
+            with self._lock:
+                self._readyJobs[cluster].append(jobInfo)
+            return False
+
+    def submit(self, jobInfo_, logdir = ''):
         self.log('Submitting job ', jobInfo_.name)
 
         if not logdir:
@@ -382,17 +409,14 @@ class DADispatcher(DAServer):
                 node = 'localhost'
 
         except:
-            with self._lock:
-                self._activeJobs[jobInfo_.cluster].remove(jobInfo_)
-                self._readyJobs[jobInfo_.cluster].append(jobInfo_)
-
             return False
             
-        with self._lock:
-            jobInfo_.proc = proc
-            jobInfo_.state = 'PENDING'
-            jobInfo_.node = node
-            jobInfo_.lastHB = time.time()
+        jobInfo_.proc = proc
+        jobInfo_.state = 'PENDING'
+        jobInfo_.node = node
+        jobInfo_.lastHB = time.time()
+
+        self._stateChanged.set()
 
         return True
 
@@ -416,10 +440,11 @@ class DADispatcher(DAServer):
             self.log('Exception while trying to remove', jobInfo_.name)
 
     def dispatch(self, logdir = ''):
-        lastUpdateTime = time.time()
+        monitorTerminate = threading.Event()
+        monitorThread = threading.Thread(target = self.monitor, args = (monitorTerminate,), name = 'monitor')
+        monitorThread.daemon = True
+        monitorThread.start()
 
-        self.printStatusWeb()
-        
         while True:
             submitted = False
             for cluster in DADispatcher.CLUSTERS:
@@ -434,75 +459,108 @@ class DADispatcher(DAServer):
 
             if nReady == 0 and nActive == 0:
                 break
-                
-            self._update.wait(20.)
-            self._update.clear()
 
-            self.printStatus()                
+            self._stateChanged.wait(60.)
 
-            if time.time() - lastUpdateTime > 60.:
-                self.queryJobStates()
-                self.printStatusWeb()
-                lastUpdateTime = time.time()
-
-    def queryJobStates(self):
-        lsfTracked = []
-        lsfNodes = []            
-
-        if len(self._activeJobs['lsf']) != 0:
-            try:
-                response = self._terminal.communicate('bjobs')[1:]
-                if DEBUG: print 'bjobs', response
-    
-                for line in response:
-                    id = line.split()[0]
-                    node = line.split()[5]
-                    lsfTracked.append(id)
-                    lsfNodes.append(node)
-
-            except:
-                self.log('Job status query failed')                    
-
-        exited = []
+            if not self._stateChanged.isSet(): # timeout
+                exited = []
+                noHB = []
+                if len(self._activeJobs['lsf']) != 0:
+                    lsfNodes = {}
+                    try:
+                        response = self._terminal.communicate('bjobs')[1:]
+                        if DEBUG: print 'bjobs', response
+            
+                        for line in response:
+                            id = line.split()[0]
+                            node = line.split()[5]
+                            lsfNodes[id] = node
         
-        with self._lock:
-            for jobInfo in self._activeJobs['lsf']:
-                # Two different tasks - if id is in the list of ids, set the node name.
-                # If not, the job may have exited abnormally - check state.
-                if jobInfo.proc in lsfTracked and jobInfo.lastHB > time.time() - 180:
-                    idx = lsfTracked.index(jobInfo.proc)
-                    jobInfo.node = lsfNodes[idx]
-                else:
-                    exited.append(jobInfo)
+                    except:
+                        self.log('Job status query failed')                    
+                
+                    with self._lock:
+                        for jobInfo in self._activeJobs['lsf']:
+                            # Two different tasks - if id is in the list of ids, set the node name.
+                            # If not, the job may have exited abnormally - check state.
+                            if jobInfo.proc in lsfNodes:
+                                if not jobInfo.node:
+                                    jobInfo.node = lsfNodes[jobInfo.proc]
 
-            for jobInfo in self._activeJobs['interactive']:
-                if not jobInfo.proc.isOpen() or jobInfo.lastHB < time.time() - 180:
-                    exited.append(jobInfo)
+                                if jobInfo.lastHB < time.time() - 120:
+                                    noHB.append(jobInfo)
+                            else:
+                                exited.append(jobInfo)
 
-            for jobInfo in self._activeJobs['local']:
-                if jobInfo.proc.poll() is not None or jobInfo.lastHB < time.time() - 180:
-                    exited.append(jobInfo)
-
-            for jobInfo in exited:
-                self.log('Set state', jobInfo.name, 'EXITED')
-                jobInfo.state = 'EXITED'
-                self._activeJobs[jobInfo.cluster].remove(jobInfo)
+                with self._lock:
+                    for jobInfo in self._activeJobs['interactive']:
+                        if not jobInfo.proc.isOpen():
+                            exited.append(jobInfo)
+                        elif jobInfo.lastHB < time.time() - 120:
+                            noHB.append(jobInfo)
+            
+                    for jobInfo in self._activeJobs['local']:
+                        if jobInfo.proc.poll() is not None:
+                            exited.append(jobInfo)
+                        elif jobInfo.lastHB < time.time() - 120:
+                            noHB.append(jobInfo)
 
                 if self._resubmit:
-                    self.kill(jobInfo) # removes from self._jobInfo
-                    cluster = jobInfo.cluster
-                    fallback = DADispatcher.FALLBACK[cluster]
-                    if fallback and len(self._activeJobs[fallback]) < DADispatcher.MAXACTIVE[fallback]:
-                        self.log('Submission of', jobInfo.name, 'falling back to', fallback)
-                        cluster = fallback
-                        
-                    self.createJob(jobInfo.name, cluster)
+                    for jobInfo in noHB:
+                        fallback = DADispatcher.FALLBACK[jobInfo.cluster]
+                        if fallback and len(self._activeJobs[fallback]) < DADispatcher.MAXACTIVE[fallback]:
+                            # This job is not responding and there is a space in the fallback queue
+                            exited.append(jobInfo)
+                
+                if len(exited):
+                    with self._lock:
+                        for jobInfo in exited:
+                            self.log('Set state', jobInfo.name, 'EXITED')
+                            jobInfo.state = 'EXITED'
+                            self._activeJobs[jobInfo.cluster].remove(jobInfo)
+            
+                            if self._resubmit:
+                                self.kill(jobInfo) # removes from self._jobInfo
+                                cluster = jobInfo.cluster
+                                fallback = DADispatcher.FALLBACK[cluster]
+                                if fallback and len(self._activeJobs[fallback]) < DADispatcher.MAXACTIVE[fallback]:
+                                    self.log('Submission of', jobInfo.name, 'falling back to', fallback)
+                                    cluster = fallback
+                                    
+                                newJobInfo = self.createJob(jobInfo.name, cluster, append = False)
+                                if self.submit(newJobInfo, logdir):
+                                    self._activeJobs[cluster].append(newJobInfo)
+                                else:
+                                    self._readyJobs[cluster].append(newJobInfo)
 
-                self._update.set()
+                                self._stateChanged.set()
+            
+                    for jobInfo in exited:
+                        with open(self._workspace + '/logs/' + jobInfo.name + '.fail', 'w') as failLog:
+                            pass
 
-        for jobInfo in exited:
-            with open(self._workspace + '/logs/' + jobInfo.name + '.fail', 'w') as failLog:
-                pass
+            time.sleep(1) # allow the monitor thread to catch up
+            self._stateChanged.clear()
+
+        monitorTerminate.set()
+        self._stateChanged.set()
+        monitorThread.join()
+
+    def monitor(self, _terminate):
+        self.printStatus()
+        self.printStatusWeb()
+
+        nCycle = 0
+        while True:
+            self._stateChanged.wait()
+            if _terminate.isSet():
+                break
+
+            self.printStatus()
+            nCycle += 1
+            if nCycle == 20:
+                self.printStatusWeb()
+                nCycle = 0
 
     def countJobs(self):
         jobCounts = dict((key, 0) for key in DADispatcher.STATES)
@@ -653,11 +711,10 @@ class DownloadRequestServer(QueuedServer):
     MAXDEPTH = 6
 
     def _serveOne(self, request_, jobName_):
-        while True:
-            response = request_.recv(1024)
-            request_.send('OK')
-            if response == 'DONE': break
-
+        request_.recv(1024)
+        request_.send('OK')
+        request_.recv(1024) # job responds when done downloading
+        
 
 class DSCPServer(QueuedServer):
     """
@@ -678,6 +735,7 @@ class DSCPServer(QueuedServer):
                 self.workdir = TMPDIR + '/' + string.join(random.sample(string.ascii_lowercase, 6), '')
                 try:
                     os.mkdir(self.workdir)
+                    break
                 except OSError:
                     pass
 
@@ -692,6 +750,7 @@ class DSCPServer(QueuedServer):
                 break
 
             if not os.path.exists(fileName):
+                request_.send('FAILED')
                 self.log(fileName, 'does not exist')
                 raise RuntimeError('NoFile')
 
@@ -703,6 +762,7 @@ class DSCPServer(QueuedServer):
                     self.log(fileName, 'was not copied to', self._targetDir)
                     raise Exception
             except:
+                request_.send('FAILED')
                 self.log('Error in copying', fileName)
                 raise RuntimeError('CopyError')
 
@@ -746,8 +806,10 @@ if __name__ == '__main__':
     parser.add_option_group(inputOpts)
 
     runtimeOpts  =  OptionGroup(parser, "Runtime options", "These options can be changed for each job submission.")
-    runtimeOpts.add_option('-c', '--cluster', dest = 'cluster', help = "Cluster to use for processing. Options are lsf, interactive, and local.", default = 'lsf', metavar = "MODE")
+    runtimeOpts.add_option('-c', '--cluster', dest = 'cluster', help = "Default cluster to use for processing. Options are lsf, interactive, and local.", default = 'lsf', metavar = "MODE")
+    runtimeOpts.add_option('-T', '--terminal', dest = 'terminal', help = "Terminal node to use.", default = TERMNODE, metavar = 'NODE')
     runtimeOpts.add_option("-b", "--bsub-options", dest = "bsubOptions", help = 'Options to pass to bsub command. -J and -cwd are set automatically. Example: -R "rusage[pool = 2048]" -q 8nh', metavar = "OPTIONS", default = "-q 8nh")
+    runtimeOpts.add_option("-N", "--no-cleanup", action = "store_true", dest = "noCleanup", help = "")
     runtimeOpts.add_option("-D", "--debug", action = "store_true", dest = "debug", help = "")
     runtimeOpts.add_option("-r", "--resubmit", action = "store_true", dest = "resubmit", help = "Resubmit the job")
     runtimeOpts.add_option("-R", "--recover", action = "store_true", dest = "recover", help = "Recover failed jobs")
@@ -782,7 +844,7 @@ if __name__ == '__main__':
 
     if DEBUG: print "opening terminal"
 
-    terminal = Terminal(TERMNODE, verbose = True)
+    terminal = Terminal(options.terminal, verbose = True)
 
     ### CONFIGURATION ###
 
@@ -802,6 +864,7 @@ if __name__ == '__main__':
                     ilog += 1
                 else:
                     break
+                
             os.rename(workspace + '/logs', workspace + '/logs_' + str(ilog))
             os.mkdir(workspace + '/logs')
     else:
@@ -873,13 +936,7 @@ if __name__ == '__main__':
     with open(workspace + '/jobconfig.py', 'w') as configFile:
         configFile.write('jobConfig = ' + str(jobConfig))
 
-    tmpWorkspace = TMPDIR + '/' + taskID
-    os.mkdir(tmpWorkspace)
-
     ### LOG DIRECTORY ###
-
-    for logFile in glob.glob(workspace + '/logs/*.log'):
-        os.remove(logFile)
 
     if os.path.realpath(jobConfig['logDir']) != workspace + '/logs':
         os.makedirs(jobConfig['logDir'])
@@ -892,10 +949,10 @@ if __name__ == '__main__':
     
     if DEBUG: print "preparing the lists of input files"
 
-    if options.resubmit:
-        allJobs = map(os.path.basename, glob.glob(workspace + '/inputs/*'))
-    elif options.recover:
+    if options.recover:
         allJobs = map(lambda name: os.path.basename(name).replace(".fail", ""), glob.glob(workspace + "/logs/*.fail"))
+    elif options.resubmit:
+        allJobs = map(os.path.basename, glob.glob(workspace + '/inputs/*'))
     else:
         # Create lists from directory entries
         # Keep the list of disks at the same time - will launch as many DownloadRequestServers as there are disks later
@@ -1043,6 +1100,11 @@ if __name__ == '__main__':
                 os.chmod(jobConfig['macro'], 0644)
                 raise RuntimeError("Compilation failed")
 
+    ### TEMPORARY SPACE FOR MODULES ###
+            
+    tmpWorkspace = TMPDIR + '/' + taskID
+    os.mkdir(tmpWorkspace)
+
     ### SERVICES ###
 
     with open(workspace + '/disks') as diskList:
@@ -1161,7 +1223,7 @@ if __name__ == '__main__':
     
     terminal.close()
 
-    if not completed:
+    if not completed and not options.noCleanup:
         response = ''
         while response != 'Y' and response != 'n':
             print 'Clean workdir (' + tmpWorkspace + ')? [Y/n] (n):'
@@ -1170,7 +1232,7 @@ if __name__ == '__main__':
 
         if response == 'Y': completed = True
             
-    if completed: shutil.rmtree(tmpWorkspace, ignore_errors = True)
+    if completed and not options.noCleanup: shutil.rmtree(tmpWorkspace, ignore_errors = True)
 
     os.chmod(jobConfig['macro'], 0644)
 
