@@ -2,19 +2,35 @@
 
 LOG=/var/log/downloadd.log
 
-if [ "$1" = "-1" ]; do
+if [ "$1" = "-1" ]; then
     LINEAR="-L"
     shift
-done
+fi
 
 i=0
 while [ $# -ne 0 ]; do
     src[$i]=$1
     dest[$i]=$2
-    echo ${src[$i]}" -> "${dest[$i]}
     i=$(($i+1))
     shift
     shift
+done
+
+if [ $i -eq 0 ]; then
+    while true; do
+        echo "From (empty line will terminate input): "
+        read src[$i]
+        [ -z "${src[$i]}" ] && break
+        echo "To: "
+        read dest[$i]
+        i=$(($i+1))
+    done
+fi
+
+i=0
+while [ $i -lt ${#src[@]} ]; do
+    echo ${src[$i]}" -> "${dest[$i]}
+    i=$(($i+1))
 done
 
 echo $(date) > $LOG
@@ -23,9 +39,17 @@ while true; do
     n=0
     i=0
     while [ $i -lt ${#src[@]} ]; do
-        dsDownload.py $LINEAR -d ${src[$i]} ${dest[$i]} >> $LOG && n=$(($n+1))
+        dsDownload.py $LINEAR -d ${src[$i]} ${dest[$i]} >> $LOG
+        ret=$?
+        [ $ret -eq 0 ] && n=$(($n+1))
+        [ $ret -eq 1 ] && break
         i=$(($i+1))
     done
+
+    if [ $i -lt ${#src[@]} ]; then
+        echo "Error occurred in download."
+        exit 1
+    fi
 
     [ $n -eq 0 ] && sleep 120
 done
