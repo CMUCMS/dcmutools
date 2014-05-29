@@ -3,10 +3,7 @@
 import os
 import sys
 
-srcdir = os.path.dirname(os.path.realpath(__file__))
-if srcdir not in sys.path:
-    sys.path.append(srcdir)
-from disks import disks
+from utility import disks
 
 def rmlink(lfn):
     if not os.path.islink(lfn):
@@ -15,16 +12,19 @@ def rmlink(lfn):
 
     pfn = os.readlink(lfn)
 
+    result = True
+
     try:
         os.remove(lfn)
     except OSError:
-        pass
+        result = False
+
     try:
         os.remove(pfn)
     except OSError:
-        pass
+        result = False
 
-    return True
+    return result
 
 def rmlfdir(dir):
     for entry in os.listdir(dir):
@@ -57,7 +57,7 @@ if __name__ == '__main__':
 
     path = args[0]
 
-    if not pat.startswith('/store'):
+    if not path.startswith('/store'):
         print 'LFN must start with /store'
         sys.exit(1)
 

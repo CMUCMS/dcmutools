@@ -5,19 +5,19 @@ import os
 import time
 import re
 import random
+import traceback
 import subprocess
+import signal
 import threading
+
+from utility import disks
 
 DEBUG = False
 
-srcdir = os.path.dirname(os.path.realpath(__file__))
-if srcdir not in sys.path:
-    sys.path.append(srcdir)
-from disks import disks
-
 def dsDownload(source, dest, deleteFile = False, deleteDir = False, singleThread = False):
     if not dest.startswith('/store'):
-        raise RuntimeError('Invalid destination path')
+	print 'Invalid destination path'
+	return 1
 
     print 'Checking destination', dest
 
@@ -40,7 +40,7 @@ def dsDownload(source, dest, deleteFile = False, deleteDir = False, singleThread
     
     files = []
     while True:
-        line = lsProc.stdout.readline()
+        line = lsProc.stdout.readline().strip()
         if DEBUG: print line
         if not line: break
         files.append((line.split()[4], int(line.split()[1])))
@@ -50,27 +50,46 @@ def dsDownload(source, dest, deleteFile = False, deleteDir = False, singleThread
     if DEBUG: print 'xrd returned with code', lsProc.returncode
     
     if lsProc.returncode != 0:
-        raise RuntimeError('xrd Error: ' + err)
+	print 'xrd Error:', err
+	return 1
 
     if len(files) == 0:
         # source can be a single file
         statProc = subprocess.Popen(['xrd', 'eoscms', 'existfile', source], stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
+        exists = False
         while True:
-            line = statProc.stdout.readline()
+            line = statProc.stdout.readline().strip()
             if not line: break
             if 'The file exists.' in line:
-                disk = random.choice(disks)
-                cont = [source]
-                execDownload(cont, dest.replace('/store', disk), None, deleteFile)
-                if len(cont) == 1:
-                    pfn = cont[0]
-                    if DEBUG: print 'ln -s', pfn, dest + '/' + os.path.basename(pfn)
-                    os.symlink(pfn, dest + '/' + os.path.basename(pfn))
-                    return 0
-                else:
-                    return 1
+                exists = True
+                break
 
-        return 0
+        returncode = 0
+        
+        sigIntHndl = signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+        if exists:
+            disk = random.choice(disks)
+            cont = [source]
+            
+            execDownload(cont, dest.replace('/store', disk), deleteFile)
+    
+            if len(cont) == 1:
+                pfn = cont[0]
+                if DEBUG: print 'ln -s', pfn, dest + '/' + os.path.basename(pfn)
+                try:
+                    os.symlink(pfn, dest + '/' + os.path.basename(pfn))
+                except OSError:
+                    print pfn
+                    traceback.print_exc()
+            else:
+                returncode = 1
+        else:
+            returncode = 2
+
+        signal.signal(signal.SIGINT, sigIntHndl)                    
+
+        return returncode
 
     files = sorted(files, cmp = lambda x, y: x[1] - y[1], reverse = True)
 
@@ -101,43 +120,73 @@ def dsDownload(source, dest, deleteFile = False, deleteDir = False, singleThread
 
     if not singleThread:
         threads = {}
+        exitFlag = threading.Event()
         printLock = threading.Lock()
         for disk in disks:
             if DEBUG: print 'Start thread', disk
-            thread = threading.Thread(target = execDownload, args = (lists[disk], dest.replace('/store', disk), printLock, deleteFile), name = disk)
+            thread = threading.Thread(target = execDownload, args = (lists[disk], dest.replace('/store', disk), deleteFile, exitFlag, printLock), name = disk)
             thread.start()
             threads[disk] = thread
-    
+
+        try:
+            for disk in disks:
+                threads[disk].join()
+                if DEBUG: print 'Thread', threads[disk].getName(), 'returned'
+
+        except KeyboardInterrupt:
+            exitFlag.set()
+            for disk in disks:
+                threads[disk].join()
+                if DEBUG: print 'Thread', threads[disk].getName(), 'returned'
+
+        sigIntHndl = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        
         success = True
         for disk in disks:
-            threads[disk].join()
-            if DEBUG: print 'Thread', threads[disk].getName(), 'returned'
-            
             for pfn in lists[disk]: # now points to local pfn
                 if DEBUG: print 'ln -s', pfn, dest + '/' + os.path.basename(pfn)
-                os.symlink(pfn, dest + '/' + os.path.basename(pfn))
-    
+                try:
+                    os.symlink(pfn, dest + '/' + os.path.basename(pfn))
+                except OSError:
+                    print pfn
+                    raise
+        
             if len(lists) != listSizes[disk]: success = False
 
+        signal.signal(signal.SIGINT, sigIntHndl)
+
     else:
-        success = True
-        disksToRun = []
-        for disk in disks: disksToRun.append(disk)
-        while len(disksToRun):
-            disk = disksToRun.pop(0)
+        allFiles = []
+        exhausted = False
+        while not exhausted:
+            exhausted = True
+            for disk in disks:
+                try:
+                    allFiles.append(lists[disk].pop(0))
+                except IndexError:
+                    continue
 
-            cont = [lists[disk].pop()]
-            execDownload(cont, dest.replace('/store', disk), None, deleteFile)
-            if len(cont) == 1:
-                pfn = cont[0]
-                if DEBUG: print 'ln -s', pfn, dest + '/' + os.path.basename(pfn)
+                exhausted = False
+
+        nTotal = len(allFiles)
+
+        exitFlag = threading.Event()
+
+        sigIntHndl = signal.signal(signal.SIGINT, lambda signum, frame: exitFlag.set())
+
+        execDownload(allFiles, dest.replace('/store', disk), deleteFile, exitFlag)
+
+        for pfn in allFiles: # now points to local pfn
+            if DEBUG: print 'ln -s', pfn, dest + '/' + os.path.basename(pfn)
+            try:
                 os.symlink(pfn, dest + '/' + os.path.basename(pfn))
-            else:
-                success = False
-                pass
+            except OSError:
+                print pfn
+                raise
+            
+        signal.signal(signal.SIGINT, sigIntHndl)
 
-            if len(lists[disk]) != 0:
-                disksToRun.append(disk)
+        success = len(allFiles) == nTotal
 
     if deleteDir and success:
         print 'Deleting EOS directory', source
@@ -147,21 +196,19 @@ def dsDownload(source, dest, deleteFile = False, deleteDir = False, singleThread
     return 0
     
 
-def execDownload(files, pfDir, lock, deleteFile = False):
-    pfns = []
-    while True:
-        try:
-            file = files.pop(0)
-        except IndexError:
-            break
-        
+def execDownload(files, pfDir, deleteFile = False, exitFlag = None, printLock = None):
+    remotePaths = []
+    while len(files):
+        remotePaths.append(files.pop(0))
+
+    for file in remotePaths:
         pfn = pfDir + '/' + os.path.basename(file)
 
-        if lock: lock.acquire()
+        if printLock: printLock.acquire()
         print file, '->', pfn
-        if lock: lock.release()
+        if printLock: printLock.release()
 
-        cpProc = subprocess.Popen(['xrdcp', '-f', 'root://eoscms//eos/cms' + file, pfn], stdout = subprocess.PIPE, stderr = subprocess.PIPE)
+        cpProc = subprocess.Popen(['xrdcp', '-f', 'root://eoscms//eos/cms' + file, pfn], stdout = subprocess.PIPE, stderr = subprocess.PIPE, preexec_fn = lambda: signal.signal(signal.SIGINT, signal.SIG_IGN))
         while cpProc.poll() is None: time.sleep(1)
         out, err = cpProc.communicate()
 
@@ -170,17 +217,18 @@ def execDownload(files, pfDir, lock, deleteFile = False):
                 delProc = subprocess.Popen(['xrd', 'eoscms', 'rm', file])
                 while delProc.poll() is None: time.sleep(1)
                 if delProc.returncode != 0:
-                    if lock: lock.acquire()
+                    if printLock: printLock.acquire()
                     print '****', file, 'not deleted'
-                    if lock: lock.release()
+                    if printLock: printLock.release()
 
-            pfns.append(pfn)
+            files.append(pfn)
         else:
-            if lock: lock.acquire()
+            if printLock: printLock.acquire()
             print '****Failed to copy', file, ':', err
-            if lock: lock.release()
+            if printLock: printLock.release()
 
-    files += pfns
+        if exitFlag and exitFlag.set(): break
+
 
 if __name__ == '__main__':
 
@@ -195,9 +243,10 @@ if __name__ == '__main__':
 
     source, dest = args
 
-    returncode = dsDownload(source, dest, deleteFile = options.deleteFile, deleteDir = options.deleteDir, singleThread = options.linear)
+    try:
+	returncode = dsDownload(source, dest, deleteFile = options.deleteFile, deleteDir = options.deleteDir, singleThread = options.linear)
+    except:
+        traceback.print_exc()
+	returncode = 1
 
-    if returncode is not None:
-        sys.exit(returncode)
-    else:
-        sys.exit(1)
+    sys.exit(returncode)

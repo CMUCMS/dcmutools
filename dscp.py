@@ -3,19 +3,29 @@
 from __future__ import print_function
 
 import os
+import sys
 import re
 import subprocess
 import random
+import traceback
+import shutil
 
-srcdir = os.path.dirname(os.path.realpath(__file__))
-if srcdir not in sys.path:
-    sys.path.append(srcdir)
-from disks import disks
+import dsrm
+from utility import *
 
-def dscp(source, lfn, logfunc):
+def dscp(source, lfn, logfunc = print, force = False):
+    logfunc('dscp', source, lfn)
+    
     if os.path.islink(lfn):
-        logfunc(lfn, 'already exists as LFN')
-        return False
+        if force:
+            try:
+                dsrm.rmlink(lfn)
+            except:
+                logfunc('Failed to remove', lfn)
+                return False
+        else:
+            logfunc(lfn, 'already exists as LFN')
+            return False
     
     if lfn[0:7] != '/store/':
         logfunc('LFN must start with /store/')
@@ -30,10 +40,7 @@ def dscp(source, lfn, logfunc):
     else:
         os.makedirs(lfdir)
 
-    try:
-        target = max(disks, key = lambda d : os.statvfs(d).f_bavail)
-    except:
-        target = disks[random.randint(0, len(disks) - 1)]
+    target = random.choice(disks)
 
     pfn = lfn.replace('/store', target)
     
@@ -45,12 +52,25 @@ def dscp(source, lfn, logfunc):
             return False
     else:
         os.makedirs(pfdir)
-    
-    proc = subprocess.Popen(['scp', '-oStrictHostKeyChecking=no', source, pfn])
-    while proc.poll() is None: pass
-    if proc.returncode != 0:
-        logfunc('Copy failed')
-        return False
+
+    if ':' in source:
+        proc = subprocess.Popen(['scp', '-oStrictHostKeyChecking=no', source, pfn], stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
+        while proc.poll() is None: pass
+        if proc.returncode != 0:
+            response = ''
+            while True:
+                line = subprocess.stdout.readline()
+                if not line: break
+                response += line
+
+            logfunc('Copy failed:', response)
+            return False
+    else:
+        try:
+            shutil.copyfile(source, pfn)
+        except:
+            logfunc('Copy failed:\n', excDump())
+            return False
     
     os.symlink(pfn, lfn)
 
@@ -58,17 +78,15 @@ def dscp(source, lfn, logfunc):
 
 if __name__ == '__main__':
 
-    import sys
-    
     try:
         source, lfn = sys.argv[1:]
-    except IndexError:
-        logfunc('Usage: dscp.py SOURCE LFN')
+    except:
+        print('Usage: dscp.py SOURCE LFN')
         sys.exit(1)
 
     try:
-        if not dscp(source, lfn, print):
+        if not dscp(source, lfn, logfunc = print):
             raise RuntimeError('')
     except:
-        print(sys.exc_info()[0:2])
+        traceback.print_exc()
         sys.exit(1)

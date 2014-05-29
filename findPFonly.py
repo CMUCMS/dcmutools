@@ -2,11 +2,9 @@
 
 import os
 import sys
+import traceback
 
-srcdir = os.path.dirname(os.path.realpath(__file__))
-if srcdir not in sys.path:
-    sys.path.append(srcdir)
-from disks import disks
+from utility import disks
 
 def searchDir(disk, path):
     result = []
@@ -17,11 +15,14 @@ def searchDir(disk, path):
         for entry in os.listdir(pfpath):
             if os.path.isdir(pfpath + '/' + entry):
                 result += searchDir(disk, path + '/' + entry)
+            elif not os.path.exists(lfpath + '/' + entry):
+                result.append(pfpath + '/' + entry)
             
         if not os.path.exists(lfpath):
             result.append(pfpath)
     except:
-        print pfpath, sys.exc_info()[0:2]
+        print pfpath
+        traceback.print_exc()
 
     return result
 
