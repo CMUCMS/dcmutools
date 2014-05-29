@@ -13,9 +13,6 @@ import Queue
 import threading
 import subprocess
 
-srcdir = os.path.dirname(os.path.realpath(__file__))
-if srcdir not in sys.path:
-    sys.path.append(srcdir)
 from globals import *
 from dscp import dscp
 

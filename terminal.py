@@ -4,9 +4,6 @@ import subprocess
 import signal
 import time
 
-srcdir = os.path.dirname(os.path.realpath(__file__))
-if srcdir not in sys.path:
-    sys.path.append(srcdir)
 from globals import *
 
 class Terminal:
