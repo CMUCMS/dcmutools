@@ -23,12 +23,11 @@ import SocketServer
 import subprocess
 import threading
 import Queue
+import traceback
 
-srcdir = os.path.dirname(os.path.realpath(__file__))
-if srcdir not in sys.path:
-    sys.path.append(srcdir)
 from globals import *
 from reducer import *
+from utility import *
 from terminal import Terminal
 from dscp import dscp
 
@@ -101,12 +100,13 @@ class DelegatingTCPServer(SocketServer.ThreadingTCPServer):
                 clientHost = socket.gethostbyaddr(clientAddr_[0])[0]
             except:
                 clientHost = 'unknown'
-                
-            self.log('Exception processing request from ' + clientHost + ': ' + str(sys.exc_info()[0:2]))
+
+            self.log('Exception processing request from ' + clientHost + ':\n' + excDump())
+            
             try:
                 request_.send('REJECT')
             except:
-                if DEBUG: self.log('Failed to send REJECT ' + str(sys.exc_info()[0:2]))
+                if DEBUG: self.log('Failed to send REJECT:\n' + excDump())
                 pass
 
         # let the client close the connection first; frees up server from having to stay in TIME_WAIT
@@ -293,7 +293,7 @@ class DADispatcher(DAServer):
                         jobInfo.proc.communicate()
 
             except:
-                self.log('Exception while serving', jobName_, sys.exc_info()[0:2])
+                self.log('Exception while serving', jobName_, '\n', excDump())
 
         if jobInfo.state == 'FAILED':
             with open(self._workspace + '/logs/' + jobName_ + '.fail', 'w') as failLog:
@@ -368,7 +368,7 @@ class DADispatcher(DAServer):
                 node = ''
     
             elif jobInfo_.cluster == 'interactive':
-                command = 'cd $TMPDIR;source {environment};darun.py {workspace} {jobName} {key} >> {log} 2>&1;exit'.format(
+                command = 'cd $TMPDIR;source {environment};darun.py -p {workspace} {jobName} {key} >> {log} 2>&1;exit'.format(
                     environment = self._workspace + '/environment',
                     workspace = self._workspace,
                     jobName = jobInfo_.name,
@@ -385,14 +385,17 @@ class DADispatcher(DAServer):
     
                 proc = term
                 node = term.node
+
+                time.sleep(5) # wait until the job starts on the remote node - avoids using the same node for 10 jobs if CPU load distribution is in place
     
             elif jobInfo_.cluster == 'local':
-                command = 'cd {tmpdir};source {environment};darun.py {workspace} {jobName} {key}'.format(
+                command = 'cd {tmpdir};source {environment};darun.py -p {workspace} {jobName} {key} >> {log} 2>&1'.format(
                     tmpdir = TMPDIR,
                     environment = self._workspace + '/environment',
                     workspace = self._workspace,
                     jobName = jobInfo_.name,
-                    key = jobInfo_.key
+                    key = jobInfo_.key,
+                    log = logdir + '/' + jobInfo_.name + '.log'
                 )
     
                 self.log(command)
@@ -490,6 +493,7 @@ class DADispatcher(DAServer):
                                 if jobInfo.lastHB < time.time() - 120:
                                     noHB.append(jobInfo)
                             else:
+                                self.log(jobInfo.name, 'disappeared from LSF job list')
                                 exited.append(jobInfo)
 
                 with self._lock:
@@ -659,7 +663,7 @@ class QueuedServer(DAServer):
                 except Queue.Empty:
                     break
                 except:
-                    self.log('Communication with ' + jobName_ + ' failed: ' + str(sys.exc_info()[0:2]))
+                    self.log('Communication with ' + jobName_ + ' failed:\n' + excDump())
                     break
 
 
@@ -685,7 +689,7 @@ class ReduceServer(DAServer):
             if response == 'FAIL':
                 raise RuntimeError('Copy failed')
         except:
-            self.log('Job', jobName_, 'Reducer exception', sys.exc_info()[0:2])
+            self.log('Job', jobName_, 'Reducer exception\n', excDump())
             try:
                 request_.send('FAILED')
             except:
@@ -742,31 +746,42 @@ class DSCPServer(QueuedServer):
         if DEBUG: self.log('Working directory', self.workdir)
 
     def _serveOne(self, request_, jobName_):
-        while True:
-            fileName = request_.recv(1024)
+        os.mkdir(self.workdir + '/' + jobName_)
 
-            if fileName == 'DONE':
+        try:
+            while True:
+                fileName = request_.recv(1024)
+    
+                if fileName == 'DONE':
+                    request_.send('OK')
+                    break
+                elif fileName == 'FAIL':
+                    break
+    
+                if not os.path.exists(fileName):
+                    request_.send('FAILED')
+                    self.log(fileName, 'does not exist')
+                    raise RuntimeError('NoFile')
+    
+                try:
+                    success = dscp(fileName, self._targetDir + '/' + os.path.basename(fileName), logfunc = self.log, force = True)
+                    if success:
+                        os.remove(fileName)
+                    else:
+                        self.log(fileName, 'was not copied to', self._targetDir)
+                        raise Exception
+                except:
+                    request_.send('FAILED')
+                    self.log('Error in copying', fileName, '\n', excDump())
+                    raise RuntimeError('CopyError')
+    
                 request_.send('OK')
-                break
 
-            if not os.path.exists(fileName):
-                request_.send('FAILED')
-                self.log(fileName, 'does not exist')
-                raise RuntimeError('NoFile')
+        except:
+            raise
 
-            try:
-                success = dscp(fileName, self._targetDir + '/' + os.path.basename(fileName), self.log)
-                if success:
-                    os.remove(fileName)
-                else:
-                    self.log(fileName, 'was not copied to', self._targetDir)
-                    raise Exception
-            except:
-                request_.send('FAILED')
-                self.log('Error in copying', fileName)
-                raise RuntimeError('CopyError')
-
-            request_.send('OK')
+        finally:
+            shutil.rmtree(self.workdir + '/' + jobName_)
 
 
 if __name__ == '__main__':
@@ -801,7 +816,9 @@ if __name__ == '__main__':
     inputOpts.add_option("-f", "--file-format", dest = "nameFormat",
         help = """\
         Wildcard expression of the name of the files in the dataset to use. Multiple files (separated by comma) can be related through the wildcard character.
-        Each instance of the match is passed to the worker function. Example: susyEvents*.root,susyTriggers*.root""",
+        Each instance of the match is passed to the worker function. Example: 'susyEvents*.root,susyTriggers*.root'.
+        It is also possible to define the jobs in terms of file names by using an regular expression enclosed in {}: pattern 'susyEvents_{[123]}_*.root,susyTriggers_*.root'
+        will create one job each for files of name susyEvents_1_*, _2_*, and _3_*.""",
         default = "*.root", metavar = "FORMAT")
     parser.add_option_group(inputOpts)
 
@@ -891,10 +908,6 @@ if __name__ == '__main__':
         else:
             jobConfig["libraries"] = []
 
-        analyzerArguments = []
-        if options.analyzerArguments.strip():
-            analyzerArguments = options.analyzerArguments.strip().split(',')
-
         outputDir = options.outputDir.strip()
         if ':' in outputDir:
             jobConfig["outputNode"] = outputDir.split(':')[0]
@@ -955,79 +968,106 @@ if __name__ == '__main__':
         allJobs = map(os.path.basename, glob.glob(workspace + '/inputs/*'))
     else:
         # Create lists from directory entries
-        # Keep the list of disks at the same time - will launch as many DownloadRequestServers as there are disks later
         
         if not options.nameFormat:
             raise RuntimeError("Input file name format")
-
-        # Get mount point -> device mapping
-        mountMap = {}
-        with open('/proc/mounts') as mountData:
-            for line in mountData:
-                mountMap[line.split()[1]] = line.split()[0]
 
         datasets = args[0:len(args) - 1]
         
         nameSpecs = map(str.strip, options.nameFormat.split(','))
 
-        lfnList = []
+        listsInTypes = []
+        res = []
         for spec in nameSpecs:
-            paths = []
-            for dataset in datasets:
-                paths += glob.glob(dataset + '/' + spec)
-            paths.sort()
+            if '{' in spec:
+                globPat = spec[:spec.find('{')] + '*' + spec[spec.find('}') + 1:]
 
-            if len(lfnList) == 0:
-                for path in paths:
-                    lfnList.append([path])
-            elif len(lfnList) == len(paths):
-                for iP in range(len(paths)):
-                    lfnList[iP].append(paths[iP])
+                jobPat = spec[spec.find('{') + 1:spec.find('}')]
+                prefix = spec[:spec.find('{')].replace('.', '[.]').replace('*', '(.*)')
+                suffix = spec[spec.find('}') + 1:].replace('.', '[.]').replace('*', '(.*)')
+                res.append(re.compile(prefix + '(' + jobPat + ')' + suffix))
             else:
-                raise RuntimeError('Number of input files do not match')
+                globPat = spec
 
-        diskNames = set()
+                res.append(re.compile(spec.replace('*', '(.*)')))
+                
+            singleTypeList = []
+            for dataset in datasets:
+                singleTypeList += glob.glob(dataset + '/' + globPat)
+            listsInTypes.append(singleTypeList)
 
-        allJobs = []
-        pfnList = []
-        
-        for lfnRow in lfnList:
-            pfnRow = []
-            for lfn in lfnRow:
-                # Convert to physical file names and write to input list along with device name
-                if os.path.islink(lfn):
-                    pfn = os.readlink(lfn)
+        nInputRows = len(listsInTypes[0])
+        for iL in range(1, len(listsInTypes)):
+            if len(listsInTypes[iL]) != nInputRows:
+                raise RuntimeError('Different number of input files for different formats')
+
+        lfnList = []
+        for iF in range(nInputRows):
+            lfnRow = [listsInTypes[0][iF]]
+            matches = res[0].match(os.path.basename(listsInTypes[0][iF]))
+            for iL in range(1, len(listsInTypes)):
+                for iG in range(len(listsInTypes[iL])):
+                    if res[iL].match(os.path.basename(listsInTypes[iL][iG])).groups() == matches.groups():
+                        lfnRow.append(listsInTypes[iL].pop(iG))
+                        break
                 else:
-                    pfn = lfn
+                    raise RuntimeError('No file found with pattern ' + nameSpecs[iL] + ' for ' + str(matches.groups()))
 
-                dirName = os.path.dirname(pfn)
-                while dirName not in mountMap: dirName = os.path.dirname(dirName)
-                pfnRow.append((mountMap[dirName], pfn))
-                diskNames.add(mountMap[dirName])
+            lfnList.append(tuple(lfnRow))
 
-            if len(pfnList) == 0:
-                allJobs.append(str(len(allJobs)))
+        # now lfnList is a list of tuples sharing the same "suffix" - group them into job inputs
 
-            pfnList.append(pfnRow)
+        jobInputs = {}
+        if '{' in nameSpecs[0]:
+            while len(lfnList):
+                lfnSet = lfnList.pop()
+                jobName = res[0].match(os.path.basename(lfnSet[0])).group(1)
+                jobInputs[jobName] = [lfnSet]
 
-            if len(pfnList) == options.filesPerJob:
-                currentJob = allJobs[-1]
-                with open(workspace + '/inputs/' + currentJob, 'w') as inputList:
-                    for pfnRow in pfnList:
-                        inputList.write(str(pfnRow) + '\n')
+                spec = nameSpecs[0]
+                prefix = spec[:spec.find('{')].replace('.', '[.]').replace('*', '(.*)')
+                suffix = spec[spec.find('}') + 1:].replace('.', '[.]').replace('*', '(.*)')
+                jobRe = re.compile(prefix + jobName + suffix)
+                iL = 0
+                while iL != len(lfnList):
+                    if jobRe.match(os.path.basename(lfnList[iL][0])):
+                        jobInputs[jobName].append(lfnList.pop(iL))
+                    else:
+                        iL += 1
+                    
+        else:
+            oneJob = []
+            while len(lfnList):
+                oneJob.append(lfnList.pop())
 
-                pfnList = []
+                if len(oneJob) == options.filesPerJob:
+                    jobName = str(len(jobInputs))
+                    jobInputs[jobName] = oneJob
+                    oneJob = []
 
-        if len(pfnList):
-            currentJob = allJobs[-1]
-            with open(workspace + '/inputs/' + currentJob, 'w') as inputList:
-                for pfnRow in pfnList:
+            if len(oneJob):
+                jobName = str(len(jobInputs))
+                jobInputs[jobName] = oneJob
+
+
+        for jobName, lfnSets in jobInputs.items():
+            with open(workspace + '/inputs/' + jobName, 'w') as inputList:
+                for lfnSet in lfnSets:
+                    pfnRow = []
+                    for lfn in lfnSet:
+                        if os.path.islink(lfn):
+                            pfn = os.readlink(lfn)
+                        else:
+                            pfn = lfn
+
+                        for disk in disks:
+                            if pfn.startswith(disk): break
+
+                        pfnRow.append((mountMap[disk], pfn))
+    
                     inputList.write(str(pfnRow) + '\n')
 
-        with open(workspace + '/disks', 'w') as diskList:
-            diskList.write(str(diskNames) + '\n')
-
-    # Created job list
+        allJobs = jobInputs.keys()
 
     # Filter jobs if requested
     if options.jobs:
@@ -1072,20 +1112,47 @@ if __name__ == '__main__':
             configFile.write('if ROOT.gROOT.LoadMacro("' + jobConfig['macro'] + '+") != 0: sys.exit(1)\n')
 
             configFile.write('arguments = (')
-            for arg in analyzerArguments:
-                arg = arg.strip()
-                if not arg: continue
-                try:
-                    eval(arg)
-                    configFile.write(arg + ', ')
-                except NameError:
-                    if arg == 'true':
-                        configFile.write('True, ')
-                    elif arg == 'false':
-                        configFile.write('False, ')
+            arguments = options.analyzerArguments.strip()
+            while True:
+                if arguments[0] == '"':
+                    end = len(arguments) + 1
+                    while True:
+                        try:
+                            val = eval(arguments[0:arguments.rfind('"', 0, end) + 1])
+                            if type(val) == str:
+                                val = '"' + val + '"'
+                                break
+                            
+                        except SyntaxError:
+                            pass
+
+                        end = arguments.rfind('"', 0, end)
+                        if end == -1:
+                            raise SyntaxError(arguments)
+
+                else:
+                    if ',' in arguments:
+                        val = arguments[0:arguments.find(',')]
                     else:
-                        # likely is an enum defined in the macro
-                        configFile.write('getattr(ROOT, "' + arg + '"), ')
+                        val = arguments
+
+                    try:
+                        eval(val)
+                    except NameError:
+                        if val == 'true':
+                            val = 'True'
+                        elif val == 'false':
+                            val = 'False'
+                        else:
+                            # likely is an enum defined in the macro
+                            val = 'getattr(ROOT, "' + val + '")'
+
+                configFile.write(val + ', ')
+                
+                head = arguments.find(',', len(val)) + 1
+                if head == 0: break
+                
+                arguments = arguments[head:].strip()
 
             configFile.write(')\n')
 
@@ -1107,12 +1174,9 @@ if __name__ == '__main__':
 
     ### SERVICES ###
 
-    with open(workspace + '/disks') as diskList:
-        diskNames = eval(diskList.readline())
-        
     # download request handlers
-    for diskName in diskNames:
-        tcpServer.addService(DownloadRequestServer(diskName))
+    for devName in mountMap.values():
+        tcpServer.addService(DownloadRequestServer(devName))
 
     # reducers
     reducer = None

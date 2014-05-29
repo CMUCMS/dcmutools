@@ -32,7 +32,6 @@ TMPDIR = os.environ['TMPDIR']
 DEBUG = False
 
 SCP = ['scp', '-oStrictHostKeyChecking=no', '-oLogLevel=quiet']
-SSH = ['ssh', '-oStrictHostKeyChecking=no', '-oLogLevel=quiet']
 
 logLock = threading.Lock()
 
@@ -163,10 +162,11 @@ def downloadFiles(workspace_, jobName_, taskID_, host_, queue_):
                             raise Exception
                 except:
                     # try scp
-                    scpProc = subprocess.Popen(SCP + [host_ + ':' + remotePath, localPath])
+                    scpProc = subprocess.Popen(SCP + [host_ + ':' + remotePath, localPath], stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
                     while scpProc.poll() is None: time.sleep(2)
+                    out = scpProc.communicate()[0]
                     if scpProc.returncode != 0:
-                        raise RuntimeError('copy failure')
+                        raise RuntimeError('copy failure: ' + out)
                 finally:
                     try:
                         ftp.quit()
@@ -208,8 +208,15 @@ def heartbeat():
 
         
 if __name__ == '__main__':
+
+    from optparse import OptionParser
+
+    parser = OptionParser()
+    parser.add_option('-p', '--print', dest = 'printToStdout', action = 'store_true', help = 'Do not redirect stdout to log file')
+
+    options, args = parser.parse_args()
     
-    workspace, jobName, key = sys.argv[1:]
+    workspace, jobName, key = args
 
     sys.argv = ['', '-b']
 
@@ -219,9 +226,10 @@ if __name__ == '__main__':
     sys.path.append(workspace)
     from jobconfig import jobConfig
 
-    logFile = open(jobConfig['logDir'] + '/' + jobName + '.log', 'a', 0)
-    sys.stdout = logFile
-    sys.stderr = logFile
+    if not options.printToStdout:
+        logFile = open(jobConfig['logDir'] + '/' + jobName + '.log', 'a', 0)
+        sys.stdout = logFile
+        sys.stderr = logFile
 
     log('darun.py', workspace, jobName, key)
 
@@ -321,13 +329,16 @@ if __name__ == '__main__':
 
             if lastPass:
                 break
-    
+
+        log('finalize')
         if not analyzer.finalize():
             raise RuntimeError("analyzer.finalize()")
+
+        analyzer = None
     
         # copy output files to remote host
 
-        outputContents = os.listdir(outputDir)
+        outputContents = sorted(os.listdir(outputDir))
         log('Produced file(s)', outputContents)
 
         if len(outputContents) == 0:
@@ -388,9 +399,9 @@ if __name__ == '__main__':
             iTry = 0
             while iTry < 3:
                 log(command)
-                copyProc = subprocess.Popen(command, stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
+                copyProc = subprocess.Popen(command)
                 while copyProc.poll() is None: time.sleep(2)
-        
+
                 if copyProc.returncode == 0:
                     if DEBUG: log('Copy success')
 
@@ -402,7 +413,7 @@ if __name__ == '__main__':
                     #    if response == 'FAILED':
                     #        continue
 
-                    if outputIsLFN:
+                    if dscp:
                         remotePath = command[-1]
                         if ':' in remotePath: # has to be the case..
                             remotePath = remotePath[remotePath.find(':') + 1:]
@@ -424,6 +435,10 @@ if __name__ == '__main__':
 
                 iTry += 1
             else:
+                if dscp:
+                    dscp.communicate('FAIL')
+                    dscp = None
+                    
                 raise RuntimeError('copy failure')
 
         if dscp:
@@ -452,3 +467,7 @@ if __name__ == '__main__':
         conn = None
         
         log('Aborted.')
+
+
+    if not options.printToStdout:
+        logFile.close()
