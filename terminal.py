@@ -65,6 +65,8 @@ class Terminal:
         except:
             if self._verbose: print 'Failed to close SSH connection:', sys.exc_info()[0:2]
 
+        Terminal.OPENTERMS.remove(self)
+
     def isOpen(self):
         return self._session and self._session.poll() is None
 
