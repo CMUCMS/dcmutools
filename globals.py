@@ -2,8 +2,8 @@ import os
 
 MINPORT = 40000
 MAXPORT = 40001
-DCMUHOST = "dcmu00"
 TERMNODE = 'lxplus'
+LOADBALANCE = True
 HTMLDIR = '/afs/cern.ch/user/y/yiiyama/www/dap/tasks'
 USER = os.environ['USER']
 #try:
