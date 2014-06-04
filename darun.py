@@ -55,7 +55,7 @@ class ServerConnection(object):
     host = ''
     port = 0
 
-    class ConnectionRejected(Exception):
+    class ConnectionError(Exception):
         pass
     
     def __init__(self, service_):
@@ -102,6 +102,7 @@ class ServerConnection(object):
                 nAttempt += 1
         else:
             log('Number of connection attempt exceeded limit.')
+            raise ServerConnection.ConnectionError
             
     def __del__(self):
         try:
@@ -115,10 +116,14 @@ class ServerConnection(object):
         if listen:
             response = self.sock.recv(1024)
             if response == 'REJECT':
-                raise ServerConnection.ConnectionRejected
+                raise ServerConnection.ConnectionError
             
             return response
-    
+
+    def close(self):
+        if self.sock:
+            self.sock.shutdown(socket.SHUT_RDWR)
+            self.sock.close()
     
 def downloadFiles(workspace_, jobName_, taskID_, host_, queue_):
 
@@ -138,9 +143,6 @@ def downloadFiles(workspace_, jobName_, taskID_, host_, queue_):
             localPath = TMPDIR + '/' + taskID_ + '/input/' + jobName_ + '/' + remotePath[remotePath.rfind('/') + 1:]
 
             conn = ServerConnection(diskName)
-            if conn.sock is None:
-                queue_.put('FAILED')
-                break
     
             try:
                 if DEBUG: log('DLD')
@@ -182,7 +184,7 @@ def downloadFiles(workspace_, jobName_, taskID_, host_, queue_):
                 log('download request failed in', jobName_, 'due to', sys.exc_info()[0:2], '. retrying')
                 break
             finally:
-                conn = None
+                conn.close()
         else:
             # copied all files in this line
             log('successfully downloaded', localPaths)
@@ -200,9 +202,8 @@ def downloadFiles(workspace_, jobName_, taskID_, host_, queue_):
 def heartbeat():
     while True:
         conn = ServerConnection('dispatch')
-        if conn.sock:
-            conn.communicate('HB')
-            conn = None
+        conn.communicate('HB')
+        conn.close()
 
         time.sleep(60)
 
@@ -245,7 +246,7 @@ if __name__ == '__main__':
     conn = ServerConnection('dispatch')
     if DEBUG: log('RUNNING')
     conn.communicate('RUNNING')
-    conn = None # delete the object to close the connection
+    conn.close()
         
     outputDir = TMPDIR + '/' + jobConfig['taskID'] + '/output/' + jobName
     inputDir = TMPDIR + '/' + jobConfig['taskID'] + '/input/' + jobName
@@ -390,8 +391,6 @@ if __name__ == '__main__':
 
         if outputIsLFN:
             dscp = ServerConnection('dscp')
-            if dscp is None:
-                raise RuntimeError('Cannot establish connection to DSCP server')
         else:
             dscp = None
 
@@ -450,7 +449,7 @@ if __name__ == '__main__':
         conn = ServerConnection('dispatch')
         if DEBUG: log('DONE')
         conn.communicate('DONE')
-        conn = None
+        conn.close()
 
         log('Done.')
 
@@ -460,11 +459,13 @@ if __name__ == '__main__':
 
         analyzer.clearInput()
 
-        conn = ServerConnection('dispatch')
-        if DEBUG: log('FAILED')
-        if conn.sock:
+        try:
+            conn = ServerConnection('dispatch')
+            if DEBUG: log('FAILED')
             conn.communicate('FAILED')
-        conn = None
+            conn.close()
+        except:
+            log('Failed to report failure to server')
         
         log('Aborted.')
 

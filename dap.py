@@ -368,6 +368,20 @@ class DADispatcher(DAServer):
                 node = ''
     
             elif jobInfo_.cluster == 'interactive':
+                node = TERMNODE
+                
+                if LOADBALANCE:
+                    hostProc = subprocess.Popen(['host', TERMNODE], stdout = subprocess.PIPE, stderr = subprocess.PIPE)
+                    out, err = hostProc.communicate()
+                    for line in out.split('\n'):
+                        if 'has address' in line:
+                            addr = line.split()[3]
+                            for term in Terminal.OPENTERMS:
+                                if term.addr == addr: break
+                            else:
+                                node = addr
+                                break
+                    
                 command = 'cd $TMPDIR;source {environment};darun.py -p {workspace} {jobName} {key} >> {log} 2>&1;exit'.format(
                     environment = self._workspace + '/environment',
                     workspace = self._workspace,
@@ -376,9 +390,9 @@ class DADispatcher(DAServer):
                     log = logdir + '/' + jobInfo_.name + '.log'
                 )
     
-                self.log(command)
+                self.log(node + ':', command)
     
-                term = Terminal(TERMNODE)
+                term = Terminal(node)
                 term.write(command)
     
                 self.log('Command issued to', term.node)
@@ -386,8 +400,6 @@ class DADispatcher(DAServer):
                 proc = term
                 node = term.node
 
-                time.sleep(5) # wait until the job starts on the remote node - avoids using the same node for 10 jobs if CPU load distribution is in place
-    
             elif jobInfo_.cluster == 'local':
                 command = 'cd {tmpdir};source {environment};darun.py -p {workspace} {jobName} {key} >> {log} 2>&1'.format(
                     tmpdir = TMPDIR,
@@ -510,14 +522,17 @@ class DADispatcher(DAServer):
                             noHB.append(jobInfo)
 
                 if self._resubmit:
+                    available = dict([(c, DADispatcher.MAXACTIVE[c] - len(self._activeJobs[c])) for c in DADispatcher.CLUSTERS])
                     for jobInfo in noHB:
                         fallback = DADispatcher.FALLBACK[jobInfo.cluster]
-                        if fallback and len(self._activeJobs[fallback]) < DADispatcher.MAXACTIVE[fallback]:
+                        if fallback and available[fallback] > 0:
                             # This job is not responding and there is a space in the fallback queue
                             exited.append(jobInfo)
+                            available[fallback] -= 1
                 
                 if len(exited):
                     with self._lock:
+                        self.log('Processing exited jobs')
                         for jobInfo in exited:
                             self.log('Set state', jobInfo.name, 'EXITED')
                             jobInfo.state = 'EXITED'
@@ -527,7 +542,7 @@ class DADispatcher(DAServer):
                                 self.kill(jobInfo) # removes from self._jobInfo
                                 cluster = jobInfo.cluster
                                 fallback = DADispatcher.FALLBACK[cluster]
-                                if fallback and len(self._activeJobs[fallback]) < DADispatcher.MAXACTIVE[fallback]:
+                                if fallback:
                                     self.log('Submission of', jobInfo.name, 'falling back to', fallback)
                                     cluster = fallback
                                     
@@ -553,18 +568,17 @@ class DADispatcher(DAServer):
     def monitor(self, _terminate):
         self.printStatus()
         self.printStatusWeb()
+        lastWebUpdate = time.time()
 
-        nCycle = 0
         while True:
             self._stateChanged.wait()
             if _terminate.isSet():
                 break
 
             self.printStatus()
-            nCycle += 1
-            if nCycle == 20:
+            if time.time() > lastWebUpdate + 60.:
                 self.printStatusWeb()
-                nCycle = 0
+                lastWebUpdate = time.time()
 
     def countJobs(self):
         jobCounts = dict((key, 0) for key in DADispatcher.STATES)
@@ -976,13 +990,20 @@ if __name__ == '__main__':
         
         nameSpecs = map(str.strip, options.nameFormat.split(','))
 
+        if '{' in nameSpecs[0]: # job name is determined from the re match of the file names
+            jobPat = nameSpecs[0][nameSpecs[0].find('{') + 1:nameSpecs[0].find('}')]
+        else:
+            jobPat = ''
+
         listsInTypes = []
         res = []
         for spec in nameSpecs:
-            if '{' in spec:
+            if jobPat:
+                if '{' + jobPat + '}' not in spec and '{}' not in spec:
+                    raise RuntimeError('File name format')
+                
                 globPat = spec[:spec.find('{')] + '*' + spec[spec.find('}') + 1:]
 
-                jobPat = spec[spec.find('{') + 1:spec.find('}')]
                 prefix = spec[:spec.find('{')].replace('.', '[.]').replace('*', '(.*)')
                 suffix = spec[spec.find('}') + 1:].replace('.', '[.]').replace('*', '(.*)')
                 res.append(re.compile(prefix + '(' + jobPat + ')' + suffix))
@@ -1113,7 +1134,7 @@ if __name__ == '__main__':
 
             configFile.write('arguments = (')
             arguments = options.analyzerArguments.strip()
-            while True:
+            while arguments:
                 if arguments[0] == '"':
                     end = len(arguments) + 1
                     while True:
