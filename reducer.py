@@ -222,13 +222,20 @@ class HEfficiencyAdder(Hadder):
             if not numer.InheritsFrom(Hadder.ROOT.TH1.Class()): continue
             denom = file.Get(numer.GetName().replace('_numer', '_denom'))
             if not denom: continue
-            eff = Hadder.ROOT.TGraphAsymmErrors(numer, denom)
-            eff.SetMarkerStyle(8)
-            eff.SetLineColor(Hadder.ROOT.kBlack)
-            eff.SetTitle(numer.GetTitle())
-            eff.GetXaxis().SetTitle(numer.GetXaxis().GetTitle())
-            eff.GetYaxis().SetRangeUser(0., 1.1)
-            eff.Write(numer.GetName().replace('_numer', '_eff'))
+
+            if numer.GetDimension() == 1 and denom.GetDimension() == 1:
+                eff = Hadder.ROOT.TGraphAsymmErrors(numer, denom)
+                eff.SetMarkerStyle(8)
+                eff.SetLineColor(Hadder.ROOT.kBlack)
+                eff.SetTitle(numer.GetTitle())
+                eff.GetXaxis().SetTitle(numer.GetXaxis().GetTitle())
+                eff.GetYaxis().SetRangeUser(0., 1.1)
+                eff.Write(numer.GetName().replace('_numer', '_eff'))
+            elif numer.GetDimension() == 2 and denom.GetDimension() == 2:
+                eff = numer.Clone(numer.GetName().replace('_numer', '_eff'))
+                eff.Sumw2()
+                eff.Divide(denom)
+                eff.Write()
 
 
 if __name__ == '__main__':
