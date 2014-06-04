@@ -108,8 +108,17 @@ if __name__ == '__main__':
 
     print 'Checking', path, 'for patterns', options.patterns.split(',')
 
-    if options.exclude.strip():
-        exclude = map(int, options.exclude.split(','))
+    excludeList = options.exclude.strip().split(',')
+    if excludeList[0]:
+        nE = len(excludeList)
+        for iE in range(nE):
+            if '-' in excludeList[iE]:
+                begin, end = excludeList[iE].split('-')
+                excludeList[iE] = begin
+                for iJ in range(int(begin) + 1, int(end) + 1):
+                    excludeList.append(str(iJ))
+            
+        exclude = map(int, excludeList)
     else:
         exclude = []
 
@@ -159,7 +168,8 @@ if __name__ == '__main__':
 
         if response == 'R' or response == 'l':
             resolved = []
-            for iD in range(len(duplicates)):
+            iD = 0
+            while iD < len(duplicates):
                 suffices = duplicates[iD]
                 print '============================='
                 files = {}
@@ -174,7 +184,7 @@ if __name__ == '__main__':
 
                 if response == 'R':
                     print 'Remove (space separated):'
-                    indices = sys.stdin.readline().strip().split()
+                    indices = map(int, sys.stdin.readline().strip().split())
     
                     for index in indices:
                         try:
@@ -193,6 +203,8 @@ if __name__ == '__main__':
 
                 for suffices in resolved:
                     duplicates.remove(suffices)
+                else:
+                    iD += 1
 
         elif response == 'All':
             for suffices in duplicates:
