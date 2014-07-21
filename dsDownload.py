@@ -19,6 +19,8 @@ def dsDownload(source, dest, deleteFile = False, deleteDir = False, singleThread
 	print 'Invalid destination path'
 	return 1
 
+    dest = os.path.realpath(dest)
+
     print 'Checking destination', dest
 
     dirs = [dest]
