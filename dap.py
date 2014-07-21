@@ -23,7 +23,6 @@ import SocketServer
 import subprocess
 import threading
 import Queue
-import traceback
 
 from globals import *
 from reducer import *
@@ -265,8 +264,10 @@ class DADispatcher(DAServer):
             if response == 'HB':
                 self.log('Heart beat from', jobName_)
                 return
-            else:
+            elif response in DADispatcher.STATES:
                 self.log('Set state', jobName_, response)
+            else:
+                raise Exception()
         except:
             response = 'UNKNOWN'
 
@@ -295,9 +296,9 @@ class DADispatcher(DAServer):
             except:
                 self.log('Exception while serving', jobName_, '\n', excDump())
 
-        if jobInfo.state == 'FAILED':
-            with open(self._workspace + '/logs/' + jobName_ + '.fail', 'w') as failLog:
-                pass
+            if jobInfo.state == 'FAILED':
+                with open(self._workspace + '/logs/' + jobName_ + '.fail', 'w') as failLog:
+                    pass
 
         self._stateChanged.set()
         
@@ -425,11 +426,12 @@ class DADispatcher(DAServer):
 
         except:
             return False
-            
-        jobInfo_.proc = proc
-        jobInfo_.state = 'PENDING'
-        jobInfo_.node = node
-        jobInfo_.lastHB = time.time()
+
+        with self._lock:
+            jobInfo_.proc = proc
+            jobInfo_.state = 'PENDING'
+            jobInfo_.node = node
+            jobInfo_.lastHB = time.time()
 
         self._stateChanged.set()
 
@@ -478,8 +480,10 @@ class DADispatcher(DAServer):
             self._stateChanged.wait(60.)
 
             if not self._stateChanged.isSet(): # timeout
+                self.log('No job changed state in the last 60 seconds. Now checking for stale jobs..')
                 exited = []
-                noHB = []
+                longpend = []
+                
                 if len(self._activeJobs['lsf']) != 0:
                     lsfNodes = {}
                     try:
@@ -494,69 +498,76 @@ class DADispatcher(DAServer):
                     except:
                         self.log('Job status query failed')                    
                 
-                    with self._lock:
-                        for jobInfo in self._activeJobs['lsf']:
-                            # Two different tasks - if id is in the list of ids, set the node name.
-                            # If not, the job may have exited abnormally - check state.
-                            if jobInfo.proc in lsfNodes:
-                                if not jobInfo.node:
-                                    jobInfo.node = lsfNodes[jobInfo.proc]
-
-                                if jobInfo.lastHB < time.time() - 120:
-                                    noHB.append(jobInfo)
-                            else:
-                                self.log(jobInfo.name, 'disappeared from LSF job list')
-                                exited.append(jobInfo)
-
                 with self._lock:
+                    for jobInfo in self._activeJobs['lsf']:
+                        # Two different tasks - if id is in the list of ids, set the node name.
+                        # If not, the job may have exited abnormally - check state.
+                        if jobInfo.proc in lsfNodes:
+                            if not jobInfo.node:
+                                jobInfo.node = lsfNodes[jobInfo.proc]
+
+                            if jobInfo.lastHB < time.time() - 120:
+                                self.log('No heartbeat from', jobInfo.name, 'for 120 seconds')
+                                if jobInfo.state == 'PENDING': longpend.append(jobInfo)
+                                elif jobInfo.state == 'RUNNING': exited.append(jobInfo)
+                        else:
+                            self.log(jobInfo.name, 'disappeared from LSF job list')
+                            exited.append(jobInfo)
+
                     for jobInfo in self._activeJobs['interactive']:
                         if not jobInfo.proc.isOpen():
                             exited.append(jobInfo)
                         elif jobInfo.lastHB < time.time() - 120:
-                            noHB.append(jobInfo)
+                            self.log('No heartbeat from', jobInfo.name, 'for 120 seconds')
+                            if jobInfo.state == 'PENDING': longpend.append(jobInfo)
+                            elif jobInfo.state == 'RUNNING': exited.append(jobInfo)
             
                     for jobInfo in self._activeJobs['local']:
                         if jobInfo.proc.poll() is not None:
                             exited.append(jobInfo)
                         elif jobInfo.lastHB < time.time() - 120:
-                            noHB.append(jobInfo)
+                            self.log('No heartbeat from', jobInfo.name, 'for 120 seconds')
+                            if jobInfo.state == 'PENDING': longpend.append(jobInfo)
+                            elif jobInfo.state == 'RUNNING': exited.append(jobInfo)
 
-                if self._resubmit:
-                    available = dict([(c, DADispatcher.MAXACTIVE[c] - len(self._activeJobs[c])) for c in DADispatcher.CLUSTERS])
-                    for jobInfo in noHB:
-                        fallback = DADispatcher.FALLBACK[jobInfo.cluster]
-                        if fallback and available[fallback] > 0:
-                            # This job is not responding and there is a space in the fallback queue
-                            exited.append(jobInfo)
-                            available[fallback] -= 1
-                
-                if len(exited):
-                    with self._lock:
-                        self.log('Processing exited jobs')
-                        for jobInfo in exited:
-                            self.log('Set state', jobInfo.name, 'EXITED')
+                    for jobInfo in exited:
+                        self.log('Set state', jobInfo.name, 'EXITED')
+                        self.kill(jobInfo) # removes from self._jobInfo
+                        jobInfo.state = 'EXITED'
+                        self._activeJobs[jobInfo.cluster].remove(jobInfo)
+
+                for jobInfo in exited:
+                    with open(self._workspace + '/logs/' + jobInfo.name + '.fail', 'w') as failLog:
+                        pass
+
+                resubmit = []
+                if self._resubmit: resubmit += exited
+
+                available = dict([(c, DADispatcher.MAXACTIVE[c] - len(self._activeJobs[c])) for c in DADispatcher.CLUSTERS])
+                for jobInfo in longpend:
+                    fallback = DADispatcher.FALLBACK[jobInfo.cluster]
+                    if fallback and available[fallback] > 0:
+                        # This job did not start in time and there is a space in the fallback queue
+                        with self._lock:
+                            self.kill(jobInfo) # removes from self._jobInfo
                             jobInfo.state = 'EXITED'
                             self._activeJobs[jobInfo.cluster].remove(jobInfo)
-            
-                            if self._resubmit:
-                                self.kill(jobInfo) # removes from self._jobInfo
-                                cluster = jobInfo.cluster
-                                fallback = DADispatcher.FALLBACK[cluster]
-                                if fallback:
-                                    self.log('Submission of', jobInfo.name, 'falling back to', fallback)
-                                    cluster = fallback
-                                    
-                                newJobInfo = self.createJob(jobInfo.name, cluster, append = False)
-                                if self.submit(newJobInfo, logdir):
-                                    self._activeJobs[cluster].append(newJobInfo)
-                                else:
-                                    self._readyJobs[cluster].append(newJobInfo)
+                            jobInfo.cluster = fallback
+                            resubmit.append(jobInfo)
+                            available[fallback] -= 1
+                
+                for jobInfo in resubmit:
+                    newJobInfo = self.createJob(jobInfo.name, jobInfo.cluster, append = False)
 
-                                self._stateChanged.set()
+                    if self.submit(newJobInfo, logdir):
+                        with self._lock:
+                            self._activeJobs[jobInfo.cluster].append(newJobInfo)
+                    else:
+                        with self._lock:
+                            self._readyJobs[jobInfo.cluster].append(newJobInfo)
+
+                    self._stateChanged.set()
             
-                    for jobInfo in exited:
-                        with open(self._workspace + '/logs/' + jobInfo.name + '.fail', 'w') as failLog:
-                            pass
 
             time.sleep(1) # allow the monitor thread to catch up
             self._stateChanged.clear()
@@ -571,7 +582,7 @@ class DADispatcher(DAServer):
         lastWebUpdate = time.time()
 
         while True:
-            self._stateChanged.wait()
+            self._stateChanged.wait(10.)
             if _terminate.isSet():
                 break
 
@@ -1139,7 +1150,8 @@ if __name__ == '__main__':
                     end = len(arguments) + 1
                     while True:
                         try:
-                            val = eval(arguments[0:arguments.rfind('"', 0, end) + 1])
+                            argEnd = arguments.rfind('"', 0, end) + 1
+                            val = eval(arguments[0:argEnd])
                             if type(val) == str:
                                 val = '"' + val + '"'
                                 break
@@ -1157,6 +1169,9 @@ if __name__ == '__main__':
                     else:
                         val = arguments
 
+                    argEnd = len(val)
+                    val = val.strip()
+
                     try:
                         eval(val)
                     except NameError:
@@ -1170,7 +1185,7 @@ if __name__ == '__main__':
 
                 configFile.write(val + ', ')
                 
-                head = arguments.find(',', len(val)) + 1
+                head = arguments.find(',', argEnd) + 1
                 if head == 0: break
                 
                 arguments = arguments[head:].strip()
@@ -1207,7 +1222,11 @@ if __name__ == '__main__':
 
         os.mkdir(tmpWorkspace + '/reduce')
 
-        reducer = eval(jobConfig['reducer'])(jobConfig['outputFile'], maxSize = jobConfig['maxSize'], workdir = tmpWorkspace + '/reduce')
+        dest = jobConfig['outputDir']
+        if jobConfig['outputNode'] != os.environ['HOSTNAME']:
+            dest = jobConfig['outputNode'] + ':' + dest
+
+        reducer = eval(jobConfig['reducer'])(jobConfig['outputFile'], dest, maxSize = jobConfig['maxSize'], workdir = tmpWorkspace + '/reduce')
         # reduceServer = ReduceServer('reduce', reducer)
         # reduceServer.setLog(tcpServer.log)
         # tcpServer.addService(reduceServer)
@@ -1216,7 +1235,7 @@ if __name__ == '__main__':
 
     if jobConfig['outputNode'] == os.environ['HOSTNAME'] and jobConfig['outputDir'][0:7] == '/store/':
         # The output is an LFN on this storage element.
-        # If reducer is ON, DSCP will be executed from Reducer.copyOutputTo().
+        # If reducer is ON, DSCP will be executed within reduce() and finalize().
         os.mkdir(tmpWorkspace + '/dscp')
         tcpServer.addService(DSCPServer('dscp', jobConfig['outputDir'], workdir = tmpWorkspace + '/dscp'))
 
@@ -1272,29 +1291,21 @@ if __name__ == '__main__':
 
     if completed and reducer:
         print 'Reducing output'
-        
+
         for outputFile in glob.glob(reducer.workdir + '/input/*'):
             reducer.inputQueue.put(os.path.basename(outputFile))
 
         reducer.reduce()
         reducer.finalize()
 
-        dest = jobConfig['outputDir']
-        if jobConfig['outputNode'] != os.environ['HOSTNAME']:
-            dest = jobConfig['outputNode'] + ':' + dest
-
-        if reducer.copyOutputTo(dest):
-            if len(reducer.succeeded) != len(allJobs):
-                print 'Number of input files to reducer does not match the number of jobs: {0}/{1}'.format(len(reducer.succeeded), len(allJobs))
-                completed = False
-            elif len(reducer.failed):
-                print 'Final reduction failed. Output in', reducer.workdir
-                completed = False
-            else:
-                reducer.cleanup()
-        else:
+        if reducer.nProcessed() != len(allJobs):
+            print 'Number of input files to reducer does not match the number of jobs: {0}/{1}'.format(reducer.nProcessed(), len(allJobs))
             completed = False
-            print 'Copy to ' + jobConfig['outputNode'] + ':' + jobConfig['outputDir'] + ' failed.'
+        elif len(reducer.result['failed']):
+            print 'Final reduction failed. Output in', reducer.workdir
+            completed = False
+        else:
+            reducer.cleanup()
 
     ### COPY LOG FILES ###
 
