@@ -826,6 +826,7 @@ if __name__ == '__main__':
 
     execOpts = OptionGroup(parser, "Job execution options", "These options will be saved in the job configuration and will be used at each job execution.")
     execOpts.add_option("-w", "--workspace", dest = 'workspace', help = 'Name of the job directory', default = "", metavar = "DIR")
+    execOpts.add_option("-W", "--overwrite-workspace", action = 'store_true', dest = 'overwriteWS', help = 'Overwrite existing workspace')
     execOpts.add_option("-e", "--environment", dest = 'environment', help = 'List of commands to set up the job environment. Defaults to the output of "scram runtime -sh" in CMSSW_BASE.', default = DEFAULTENV, metavar = "CMD")
     execOpts.add_option("-a", "--analyzer-arguments", dest = 'analyzerArguments', help = "Arguments to be passed to the initialize() function of the analyzer object.", default = "", metavar = "ARGS")
     execOpts.add_option("-I", "--include", dest = "includePaths", help = "Include path for compilation", default = "", metavar = "-IDIR1 [-IDIR2 [-IDIR3 ...]]")
@@ -912,7 +913,11 @@ if __name__ == '__main__':
     else:
         workspace = os.path.realpath(options.workspace)
         if os.path.exists(workspace):
-            raise RuntimeError("{0} already exists".format(workspace))
+            if options.overwriteWS:
+                print 'Overwriting workspace', workspace
+                shutil.rmtree(workspace)
+            else:
+                raise RuntimeError("{0} already exists".format(workspace))
 
         jobConfig = {}
 

@@ -92,7 +92,7 @@ class Reducer(object):
                 os.rename(oldName, newName)
 
                 self.result[newName] = self.result[oldName]
-                self.result[oldName] = []
+                self.result.pop(oldName)
 
                 suffix = self._targetFileSuffix
 
