@@ -55,32 +55,28 @@ if __name__ == '__main__':
 
     options, args = parser.parse_args()
 
-    path = args[0]
-
-    if not path.startswith('/store'):
-        print 'LFN must start with /store'
-        sys.exit(1)
-
-    if os.path.isdir(path):
-        if not options.recursive:
-            print path, 'is a directory but recursive flag is not set.'
+    for path in args:
+        if not path.startswith('/store'):
+            print 'LFN must start with /store'
             sys.exit(1)
+    
+        if os.path.isdir(path):
+            if not options.recursive:
+                print path, 'is a directory but recursive flag is not set.'
+                sys.exit(1)
+            else:
+                print 'Recursive flag is set. Are you sure you want to remove', path, '? [Y/n]'
+                while True:
+                    response = sys.stdin.readline().strip()
+                    if response == 'Y':
+                        success = rmlfdir(path)
+                        break
+                    elif response == 'n':
+                        success = True
+                        break
+    
         else:
-            print 'Recursive flag is set. Are you sure you want to remove', path, '? [Y/n]'
-            while True:
-                response = sys.stdin.readline().strip()
-                if response == 'Y':
-                    success = rmlfdir(path)
-                    break
-                elif response == 'n':
-                    success = True
-                    break
-
-    else:
-        success = rmlink(path)
-
-    if success:
-        sys.exit(0)
-    else:
-        sys.exit(1)
-        
+            success = rmlink(path)
+    
+        if not success:
+            sys.exit(1)
