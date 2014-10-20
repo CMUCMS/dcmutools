@@ -209,7 +209,7 @@ class Hadder(Reducer):
                     inputPath = self.workdir + '/input/' + inputName
 
                     totalSize += os.stat(inputPath).st_size
-                    if self._maxSize != 0 and totalSize / 1048576 >= self._maxSize:
+                    if len(toAdd) != 0 and self._maxSize != 0 and totalSize / 1048576 >= self._maxSize:
                         self.inputQueue.put(inputName)
                         break
 
