@@ -832,6 +832,7 @@ if __name__ == '__main__':
     execOpts.add_option("-I", "--include", dest = "includePaths", help = "Include path for compilation", default = "", metavar = "-IDIR1 [-IDIR2 [-IDIR3 ...]]")
     execOpts.add_option("-l", "--lib", dest = "libraries", help = "Libraries to load", default = "", metavar = "LIB1[,LIB2[,LIB3...]]")
     execOpts.add_option("-d", "--output-dir", dest = "outputDir", help = "Output [host:]directory", default = "./", metavar = "DIR")
+    execOpts.add_option("-x", "--no-suffix", action = 'store_true', dest = "noSuffix", help = "Do not add suffix to the output files.")
     execOpts.add_option("-u", "--reducer", dest = "reducer", help = "Reducer module. Set to None to disable reducer. Default is Hadder.", default = "Hadder", metavar = "MODULE")
     execOpts.add_option("-o", "--output-file", dest = "outputFile", help = "Output file name. Ignored when reducer is None", default = "", metavar = "OUT")
     execOpts.add_option("-m", "--max-size", dest = "maxSize", help = "Approximate maximum size in MB of the reducer output.", default = 1024, metavar = "SIZE")
@@ -843,7 +844,7 @@ if __name__ == '__main__':
         help = """\
         Wildcard expression of the name of the files in the dataset to use. Multiple files (separated by comma) can be related through the wildcard character.
         Each instance of the match is passed to the worker function. Example: 'susyEvents*.root,susyTriggers*.root'.
-        It is also possible to define the jobs in terms of file names by using an regular expression enclosed in {}: pattern 'susyEvents_{[123]}_*.root,susyTriggers_*.root'
+        It is also possible to define the jobs in terms of file names by using an regular expression enclosed in {}: pattern 'susyEvents_{[123]}_*.root,susyTriggers_{}_*.root'
         will create one job each for files of name susyEvents_1_*, _2_*, and _3_*.""",
         default = "*.root", metavar = "FORMAT")
     parser.add_option_group(inputOpts)
@@ -947,6 +948,7 @@ if __name__ == '__main__':
         
         jobConfig["outputDir"] = outputDir
         jobConfig["outputFile"] = options.outputFile.strip()
+        jobConfig['addSuffix'] = not options.noSuffix
         jobConfig["reducer"] = options.reducer.strip()
         jobConfig["maxSize"] = options.maxSize
 
@@ -1042,9 +1044,12 @@ if __name__ == '__main__':
         for iF in range(nInputRows):
             lfnRow = [listsInTypes[0][iF]]
             matches = res[0].match(os.path.basename(listsInTypes[0][iF]))
+            if not matches: continue
             for iL in range(1, len(listsInTypes)):
                 for iG in range(len(listsInTypes[iL])):
-                    if res[iL].match(os.path.basename(listsInTypes[iL][iG])).groups() == matches.groups():
+                    auxMatches = res[iL].match(os.path.basename(listsInTypes[iL][iG]))
+                    if not auxMatches: continue
+                    if auxMatches.groups() == matches.groups():
                         lfnRow.append(listsInTypes[iL].pop(iG))
                         break
                 else:

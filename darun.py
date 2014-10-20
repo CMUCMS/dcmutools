@@ -356,7 +356,8 @@ if __name__ == '__main__':
             localPath = outputDir + '/' + outputContents[0]
     
             remoteFileName = jobConfig['outputFile']
-            remoteFileName = remoteFileName[0:remoteFileName.rfind('.')] + '_' + jobName + remoteFileName[remoteFileName.rfind('.'):]
+            if 'addSuffix' not in jobConfig or jobConfig['addSuffix']: # not in case for backward compatibility
+                remoteFileName = remoteFileName[0:remoteFileName.rfind('.')] + '_' + jobName + remoteFileName[remoteFileName.rfind('.'):]
   
 #            conn = ServerConnection('reduce')
 #            if DEBUG: log('DEST')
@@ -377,7 +378,8 @@ if __name__ == '__main__':
                 localPath = outputDir + '/' + localFileName
     
                 remoteFileName = localFileName
-                remoteFileName = remoteFileName[0:remoteFileName.rfind('.')] + '_' + jobName + remoteFileName[remoteFileName.rfind('.'):]
+                if 'addSuffix' not in jobConfig or jobConfig['addSuffix']: # not in case for backward compatibility
+                    remoteFileName = remoteFileName[0:remoteFileName.rfind('.')] + '_' + jobName + remoteFileName[remoteFileName.rfind('.'):]
 
                 remotePath = jobConfig['outputDir'] + '/' + remoteFileName
                
