@@ -57,6 +57,10 @@ def dsDownload(source, dest, deleteFile = False, deleteDir = False, singleThread
 
     if len(files) == 0:
         # source can be a single file
+        if os.path.islink(dest + '/' + os.path.basename(source)):
+            print 'LFN', dest + '/' + os.path.basename(source), 'already exists.'
+            return 2
+
         statProc = subprocess.Popen(['xrd', 'eoscms', 'existfile', source], stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
         exists = False
         while True:
@@ -95,8 +99,6 @@ def dsDownload(source, dest, deleteFile = False, deleteDir = False, singleThread
 
     files = sorted(files, cmp = lambda x, y: x[1] - y[1], reverse = True)
 
-    print 'Downloading', len(files), 'files'
-
     firstdisk = random.choice(disks)
 
     if DEBUG: print 'First disk', firstdisk
@@ -105,13 +107,21 @@ def dsDownload(source, dest, deleteFile = False, deleteDir = False, singleThread
     for disk in disks:
         lists[disk] = []
 
+    nF = 0
     dir = 1
     disk = firstdisk
-    for file in files:
-        lists[disk].append(file[0])
+    for file, size in files:
+        if os.path.islink(dest + '/' + os.path.basename(file)):
+            print 'Skipping', dest + '/' + os.path.basename(file)
+            continue
+        
+        nF += 1
+        lists[disk].append(file)
         disk = disks[(disks.index(disk) + dir) % len(disks)]
         if disk == firstdisk:
             dir *= -1
+
+    print 'Downloading', nF, 'files'
 
     listSizes = dict([(disk, len(lists[disk])) for disk in disks])
 
