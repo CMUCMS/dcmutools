@@ -34,8 +34,10 @@ class Terminal:
 	    preexec_fn = lambda : signal.signal(signal.SIGINT, signal.SIG_IGN))
         
         self.node = self.communicate('echo $HOSTNAME')[0]
-        self.addr = self.communicate('/sbin/ifconfig eth0 | sed -n "s/^ *inet addr:\([^ ]*\).*/\1/p"')[0]
-        if self._verbose: print 'Terminal opened on ' + self.node, self.addr
+        hostProc = subprocess.Popen(['host', self.node], stdout = subprocess.PIPE, stderr = subprocess.PIPE)
+        out, err = hostProc.communicate()
+        self.addr = out.strip().split()[3]
+        if self._verbose: print 'Terminal opened on ' + self.node, '(' + self.addr + ')'
 
         Terminal.OPENTERMS.append(self)
         
