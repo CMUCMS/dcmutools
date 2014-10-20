@@ -10,7 +10,7 @@ USER = os.environ['USER']
 #    DEFAULTENV = 'cd ' + os.environ['CMSSW_BASE'] + ';scram runtime -sh'
 #except KeyError:
 #    DEFAULTENV = ''
-DEFAULTENV = 'cd /afs/cern.ch/user/y/yiiyama/cmssw/SLC6Ntuplizer5314;scram runtime -sh'
+DEFAULTENV = 'cd /afs/cern.ch/user/y/yiiyama/cmssw/SLC6Ntuplizer5321;scram runtime -sh'
 try:
     TMPDIR = os.environ['TMPDIR']
 except KeyError:
