@@ -647,8 +647,7 @@ class DADispatcher(DAServer):
         if not os.path.exists(statusDir):
             os.makedirs(statusDir)
             for job in allJobs:
-                with open(statusDir + '/' + job + '.UNKNOWN', 'w') as log:
-                    pass
+                open(statusDir + '/' + job + '.UNKNOWN', 'w').close()
 
         with self._lock:
             for statusFile in os.listdir(statusDir):
@@ -952,6 +951,9 @@ if __name__ == '__main__':
         jobConfig["reducer"] = options.reducer.strip()
         jobConfig["maxSize"] = options.maxSize
 
+        if jobConfig['reducer'] != 'None' and not jobConfig['outputFile']:
+            raise RuntimeError('Reducer requires output file name specification')
+
         ### OPEN WORKSPACE ###
 
         os.mkdir(workspace)
@@ -1224,26 +1226,10 @@ if __name__ == '__main__':
     for devName in mountMap.values():
         tcpServer.addService(DownloadRequestServer(devName))
 
-    # reducers
-    reducer = None
     if jobConfig['reducer'] != 'None':
-        if not jobConfig['outputFile']:
-            raise RuntimeError('Reducer requires output file name specification')
+        os.makedirs(tmpWorkspace + '/reduce/input')
 
-        os.mkdir(tmpWorkspace + '/reduce')
-
-        dest = jobConfig['outputDir']
-        if jobConfig['outputNode'] != os.environ['HOSTNAME']:
-            dest = jobConfig['outputNode'] + ':' + dest
-
-        reducer = eval(jobConfig['reducer'])(jobConfig['outputFile'], dest, maxSize = jobConfig['maxSize'], workdir = tmpWorkspace + '/reduce')
-        # reduceServer = ReduceServer('reduce', reducer)
-        # reduceServer.setLog(tcpServer.log)
-        # tcpServer.addService(reduceServer)
-        # Choosing to run reducer "offline" and not as a service; adds stability with a price of little time rag after the jobs are done. darun jobs will upload the output to $TMPDIR/{taskID}/reduce
-        reducer.setLog(lambda *args : tcpServer.log(string.join(map(str, args)), name = 'reducer'))
-
-    if jobConfig['outputNode'] == os.environ['HOSTNAME'] and jobConfig['outputDir'][0:7] == '/store/':
+    elif jobConfig['outputNode'] == os.environ['HOSTNAME'] and jobConfig['outputDir'][0:7] == '/store/':
         # The output is an LFN on this storage element.
         # If reducer is ON, DSCP will be executed within reduce() and finalize().
         os.mkdir(tmpWorkspace + '/dscp')
@@ -1299,7 +1285,15 @@ if __name__ == '__main__':
 
     ### REDUCER ###
 
-    if completed and reducer:
+    if completed and jobConfig['reducer'] != 'None':
+        dest = jobConfig['outputDir']
+        if jobConfig['outputNode'] != os.environ['HOSTNAME']:
+            dest = jobConfig['outputNode'] + ':' + dest
+
+        reducer = eval(jobConfig['reducer'])(jobConfig['outputFile'], dest, maxSize = jobConfig['maxSize'], workdir = tmpWorkspace + '/reduce')
+
+        reducer.setLog(lambda *args : tcpServer.log(string.join(map(str, args)), name = 'reducer'))
+
         print 'Reducing output'
 
         for outputFile in glob.glob(reducer.workdir + '/input/*'):

@@ -359,12 +359,6 @@ if __name__ == '__main__':
             if 'addSuffix' not in jobConfig or jobConfig['addSuffix']: # not in case for backward compatibility
                 remoteFileName = remoteFileName[0:remoteFileName.rfind('.')] + '_' + jobName + remoteFileName[remoteFileName.rfind('.'):]
   
-#            conn = ServerConnection('reduce')
-#            if DEBUG: log('DEST')
-#            response = conn.communicate('DEST')
-#            if DEBUG: log(ServerConnection.host + ' says ' + response)
-#            remotePath = response + '/' + remoteFileName
-# Choosing to run reducer "offline" and not as a service; adds stability with a price of little time rag after the jobs are done. darun jobs will upload the output to $TMPDIR/{taskID}
             remotePath = jobConfig['serverWorkDir'] + '/reduce/input/' + remoteFileName
 
             copyCommands = [SCP + [localPath, jobConfig['serverHost'] + ':' + remotePath]]
@@ -405,14 +399,6 @@ if __name__ == '__main__':
 
                 if copyProc.returncode == 0:
                     if DEBUG: log('Copy success')
-
-                    #if useReducer:                    
-                    #    conn.sock.send(remoteFileName)
-                    #    response = conn.sock.recv(1024)
-                    #    if DEBUG: log(ServerConnection.host + ' says ' + response)
-                    #    conn = None
-                    #    if response == 'FAILED':
-                    #        continue
 
                     if dscp:
                         remotePath = command[-1]
